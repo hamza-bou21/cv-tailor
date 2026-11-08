@@ -237,3 +237,84 @@ def compile_to_single_page(
             return pdf_path
 
     return pdf_path
+
+from models import CoverLetter
+import datetime
+
+def render_letter_latex(letter: CoverLetter, master_cv: MasterCV) -> str:
+    """Renders a formal ATS-compliant LaTeX cover letter."""
+    p_info = master_cv.personal_info
+    current_date = datetime.date.today().strftime("%B %d, %Y")
+
+    header = rf"""\documentclass[11pt,a4paper]{{article}}
+\usepackage[utf8]{{inputenc}}
+\usepackage[margin=1.0in]{{geometry}}
+\usepackage{{hyperref}}
+\usepackage{{parskip}}
+
+\hypersetup{{
+    colorlinks=true,
+    linkcolor=black,
+    urlcolor=blue
+}}
+
+\pagestyle{{empty}}
+
+\begin{{document}}
+
+\begin{{flushleft}}
+    {{\LARGE \textbf{{{escape_latex(p_info.name)}}}}} \\[4pt]
+    \href{{mailto:{p_info.email}}}{{{escape_latex(p_info.email)}}} $|$ 
+    \href{{https://{p_info.linkedin}}}{{{escape_latex(p_info.linkedin)}}} $|$ 
+    \href{{https://{p_info.github}}}{{{escape_latex(p_info.github)}}}
+\end{{flushleft}}
+
+\vspace{{6pt}}
+\hrule
+\vspace{{14pt}}
+
+\begin{{flushleft}}
+    \textbf{{{escape_latex(current_date)}}} \\[8pt]
+    \textbf{{Hiring Team}} \\
+    \textbf{{{escape_latex(letter.company)}}}
+\end{{flushleft}}
+
+\vspace{{12pt}}
+\noindent {escape_latex(letter.salutation)}
+
+"""
+
+    # Assemble paragraphs from sentences
+    body_paragraphs = []
+    for paragraph in letter.paragraphs:
+        paragraph_text = " ".join(s.text.strip() for s in paragraph.sentences if s.text.strip())
+        body_paragraphs.append(escape_latex(paragraph_text))
+
+    body_latex = "\n\n".join(body_paragraphs)
+
+    # Clean signoff so it never duplicates the candidate's name
+    clean_signoff = letter.signoff.split(",")[0].strip()
+    if letter.signoff.lower().replace(",", "").strip().endswith(p_info.name.lower()):
+        clean_signoff = "Sincerely"
+
+    footer = rf"""
+
+\vspace{{14pt}}
+\noindent {escape_latex(clean_signoff)}, \\[24pt]
+\textbf{{{escape_latex(p_info.name)}}}
+
+\end{{document}}
+"""
+
+    return header + body_latex + footer
+
+def compile_letter_pdf(
+    letter: CoverLetter, 
+    master_cv: MasterCV, 
+    output_dir: str = "output", 
+    job_name: str = "cover_letter"
+) -> str:
+    """Compiles the cover letter into a standalone PDF."""
+    tex_code = render_letter_latex(letter, master_cv)
+    pdf_path, _ = compile_latex(tex_code, output_dir=output_dir, job_name=job_name)
+    return pdf_path

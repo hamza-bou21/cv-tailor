@@ -3,7 +3,17 @@ import json
 import yaml
 from dotenv import load_dotenv
 from groq import Groq
-from models import MasterCV, FitAnalysis, CVSelection, SelectedExperience, SelectedProject
+from models import (
+    MasterCV, 
+    FitAnalysis, 
+    CVSelection, 
+    SelectedExperience, 
+    SelectedProject,
+    CoverLetter, 
+    CoverLetterDraft,
+    CoverLetterParagraph,
+    CoverLetterSentence
+)
 import re
 from typing import Literal
 
@@ -233,3 +243,129 @@ def select_cv_content(
         projects=cleaned_projects,
         education_ids=cleaned_education
     )
+from models import (
+    MasterCV, 
+    FitAnalysis, 
+    CVSelection, 
+    SelectedExperience, 
+    SelectedProject,
+    CoverLetter, 
+    CoverLetterSentence
+)
+
+def verify_cover_letter(letter: CoverLetterDraft, master_cv: MasterCV) -> list[str]:
+    """Runs deterministic verification on citations and numerals across all sentences."""
+    errors = []
+
+    # 1. Check citation IDs across paragraphs
+    all_cited_ids = [
+        cid 
+        for p in letter.paragraphs 
+        for s in p.sentences 
+        for cid in s.based_on
+    ]
+    invalid_ids = verify_citation_ids(all_cited_ids, master_cv)
+    if invalid_ids:
+        errors.append(f"Invalid citation IDs referenced: {', '.join(invalid_ids)}")
+
+    # 2. Check numerals across sentence text
+    full_text = " ".join(s.text for p in letter.paragraphs for s in p.sentences)
+    invalid_numerals = verify_numerals(full_text, master_cv)
+    if invalid_numerals:
+        errors.append(f"Fabricated numerals outside facts/allowlist: {', '.join(invalid_numerals)}")
+
+    return errors
+
+def generate_cover_letter(
+    job_text: str,
+    master_cv: MasterCV,
+    language: Literal["en", "fr"] = "en",
+    model: str = "openai/gpt-oss-120b",
+    max_retries: int = 2
+) -> CoverLetter:
+    """
+    FR-9 & FR-10: Generates a tailored 3-4 paragraph cover letter where every factual claim
+    cites a Master CV ID. Automatically triggers re-prompting if verification checks fail.
+    """
+    # Use CoverLetterDraft schema so the model only outputs letter content
+    schema = CoverLetterDraft.model_json_schema()
+
+    catalog = {
+        "candidate_name": master_cv.personal_info.name,
+        "facts": master_cv.facts.model_dump(),
+        "skills": [{"id": s.id, "name": getattr(s, language)} for s in master_cv.skills],
+        "experience": [
+            {
+                "id": exp.id,
+                "role": getattr(exp.role, language),
+                "company": exp.company,
+                "bullets": [{"id": b.id, "text": getattr(b, language)} for b in exp.bullets]
+            }
+            for exp in master_cv.experience
+        ],
+        "projects": [
+            {
+                "id": proj.id,
+                "name": proj.name,
+                "bullets": [{"id": b.id, "text": getattr(b, language)} for b in proj.bullets]
+            }
+            for proj in master_cv.projects
+        ]
+    }
+
+    base_prompt = f"""
+You are an expert technical cover letter writer.
+Draft a professional, compelling, 3-to-4 paragraph cover letter tailored to the job description.
+
+TARGET LANGUAGE: {language}
+
+CANDIDATE DATA & VALID IDs:
+{json.dumps(catalog, indent=2)}
+
+JOB DESCRIPTION:
+\"\"\"{job_text}\"\"\"
+
+CRITICAL HONESTY RULES:
+1. Every sentence making a factual statement (experience, metrics, tooling) MUST populate 'based_on' with valid IDs from the candidate data.
+2. If a sentence is an opening greeting, transition, or closing signoff, 'based_on' must be an empty list [].
+3. DO NOT invent metrics or numbers. Only use numbers present in the documented facts or bullets.
+4. DO NOT reference technologies or skills not listed in the candidate data.
+5. Provide 3 to 4 paragraphs in total.
+"""
+
+    messages = [
+        {"role": "system", "content": f"You are a strict technical writer with zero-hallucination constraints. Output JSON matching schema: {json.dumps(schema)}"},
+        {"role": "user", "content": base_prompt}
+    ]
+
+    for attempt in range(max_retries + 1):
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            response_format={"type": "json_object"},
+            temperature=0.1,
+        )
+
+        data = json.loads(response.choices[0].message.content)
+        draft = CoverLetterDraft(**data)
+
+        # Run deterministic verification in Python
+        errors = verify_cover_letter(draft, master_cv)
+
+        if not errors:
+            return CoverLetter(**draft.model_dump(), verification_passed=True, verification_warnings=[])
+
+        print(f"[!] Verification failed on attempt {attempt + 1}: {errors}")
+
+        if attempt < max_retries:
+            correction_instruction = f"""
+Your previous output failed automated fact-checking checks with the following violations:
+{json.dumps(errors, indent=2)}
+
+Rewrite the cover letter to completely resolve these violations.
+Ensure every cited ID strictly matches an ID from the candidate catalog, and remove or correct any fabricated numerals.
+"""
+            messages.append({"role": "assistant", "content": response.choices[0].message.content})
+            messages.append({"role": "user", "content": correction_instruction})
+
+    return CoverLetter(**draft.model_dump(), verification_passed=False, verification_warnings=errors)

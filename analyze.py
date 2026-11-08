@@ -1,7 +1,10 @@
 import argparse
+import os
 import sys
-from core import load_master_cv, analyze_job, select_cv_content
-from latex_builder import compile_to_single_page
+from core import load_master_cv, analyze_job, select_cv_content, generate_cover_letter
+from latex_builder import compile_to_single_page, compile_letter_pdf
+from db import init_db, log_document
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description="CV Tailor - Job Fit Analyzer & Selection Engine")
@@ -21,11 +24,21 @@ def parse_args():
         default="en",
         help="Target language for tailored content ('en' or 'fr', default: 'en')"
     )
+    parser.add_argument(
+        "--letter",
+        action="store_true",
+        help="Also generate a verified, tailored cover letter"
+    )
     return parser.parse_args()
+
 
 def main():
     args = parse_args()
 
+    # 1. Initialize SQLite database and tables at the very start of execution
+    init_db()
+
+    # Load CV profile
     cv_path = args.cv
     try:
         cv = load_master_cv(cv_path)
@@ -33,6 +46,7 @@ def main():
         print(f"Notice: '{cv_path}' not found. Falling back to 'demo/master_cv.yaml'.")
         cv = load_master_cv("demo/master_cv.yaml")
 
+    # Load Target Job Description
     try:
         with open(args.job, "r", encoding="utf-8") as f:
             job_text = f.read()
@@ -80,12 +94,52 @@ def main():
                 bullet_list = ", ".join(proj.bullet_ids) if proj.bullet_ids else "None"
                 print(f"  • {proj.project_id} ({len(proj.bullet_ids)} bullets): {bullet_list}")
 
-        # Compile PDF via the single-page constraint loop
-        print("\nCompiling single-page PDF...")
-        pdf_path = compile_to_single_page(selection, cv, output_dir="output", job_name="tailored_cv")
-        print(f"[Done] Ready at: {pdf_path}")
+        # 2. Compile CV PDF and log it to SQLite immediately after generation
+        print("\nCompiling single-page CV PDF...")
+        cv_pdf = compile_to_single_page(selection, cv, output_dir="output", job_name="tailored_cv")
+        cv_tex = os.path.join("output", "tailored_cv.tex")
+        
+        cv_id = log_document(
+            job_title=selection.target_role,
+            company="CloudNext",
+            fit_score=analysis.fit_score,
+            verdict=analysis.verdict,
+            pdf_path=cv_pdf,
+            tex_path=cv_tex,
+            language=args.lang,
+            doc_type="cv"
+        )
+        print(f"[Done] CV PDF: {cv_pdf} (Audit Log ID: {cv_id})")
+
+        # 3. Compile Cover Letter PDF and log it to SQLite
+        if args.letter:
+            print(f"\nGenerating and verifying tailored cover letter ({args.lang.upper()})...")
+            letter = generate_cover_letter(job_text, cv, language=args.lang)
+
+            if letter.verification_passed:
+                print("[✓] Cover letter passed deterministic honesty verification.")
+            else:
+                print(f"[!] Cover letter generated with warnings: {letter.verification_warnings}")
+
+            letter_pdf = compile_letter_pdf(letter, cv, output_dir="output", job_name="cover_letter")
+            letter_tex = os.path.join("output", "cover_letter.tex")
+
+            warnings_str = ", ".join(letter.verification_warnings) if letter.verification_warnings else None
+            letter_id = log_document(
+                job_title=letter.target_role,
+                company=letter.company,
+                fit_score=analysis.fit_score,
+                verdict=analysis.verdict,
+                pdf_path=letter_pdf,
+                tex_path=letter_tex,
+                language=args.lang,
+                doc_type="cover_letter",
+                warnings=warnings_str
+            )
+            print(f"[Done] Cover Letter PDF: {letter_pdf} (Audit Log ID: {letter_id})")
     else:
-        print("\n[!] Verdict is SKIP: Skipping CV content selection and compilation.")
+        print("\n[!] Verdict is SKIP: Skipping CV and letter generation.")
+
 
 if __name__ == "__main__":
     main()

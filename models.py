@@ -129,3 +129,31 @@ class CVSelection(BaseModel):
     experiences: List[SelectedExperience] = Field(description="Selected experience blocks and their chosen bullet IDs.")
     projects: List[SelectedProject] = Field(default_factory=list, description="Selected project IDs and their chosen bullet IDs.")
     education_ids: List[str] = Field(default_factory=list, description="Selected education IDs.")
+
+class CoverLetterSentence(BaseModel):
+    text: str = Field(description="Sentence prose.")
+    based_on: List[str] = Field(
+        default_factory=list,
+        description="IDs of skills, experience bullets, or projects justifying this sentence. Empty if purely conversational/greeting."
+    )
+
+class CoverLetterParagraph(BaseModel):
+    sentences: List[CoverLetterSentence] = Field(
+        description="List of cited sentences forming a single coherent paragraph."
+    )
+
+class CoverLetterDraft(BaseModel):
+    """Schema provided to the LLM (pure content, no internal audit fields)."""
+    language: Literal["en", "fr"]
+    company: str
+    target_role: str
+    salutation: str
+    paragraphs: List[CoverLetterParagraph] = Field(
+        description="List of 3 to 4 distinct paragraphs."
+    )
+    signoff: str
+
+class CoverLetter(CoverLetterDraft):
+    """Full application model with deterministic verification status."""
+    verification_passed: bool = False
+    verification_warnings: List[str] = Field(default_factory=list)
