@@ -218,3 +218,21 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Private CV Data & SQLite DB
+*.yaml
+!demo_master_cv.yaml
+*.db
+
+# Compiled LaTeX/PDF outputs
+*.pdf
+*.tex
+*.log
+*.aux
+*.out
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+
+# Secrets
+.env
