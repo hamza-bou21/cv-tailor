@@ -1,0 +1,9 @@
+Role: Senior Backend Engineer
+Company: CloudNext
+
+Requirements:
+- 5+ years of experience in backend development using Python and FastAPI.
+- Deep familiarity with PostgreSQL and Redis caching strategies.
+- Experience with high-traffic distributed architectures (>5000 RPS).
+- Experience leading small engineering teams is a plus.
+- Hands-on experience with Kubernetes and AWS infrastructure.

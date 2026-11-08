@@ -95,3 +95,21 @@ class MasterCV(BaseModel):
     experience: List[Experience] = Field(default_factory=list)
     projects: List[Project] = Field(default_factory=list)
     education: List[Education] = Field(default_factory=list)
+class DocumentRecord(BaseModel):
+    """Schema tracking generated documents and provenance audit trails."""
+    id: Optional[str] = None
+    job_id: str
+    doc_type: Literal["cv", "letter"]
+    language: Literal["en", "fr"]
+    pdf_path: str
+    tex_path: str
+    date_generated: str
+    verification_warnings: List[str] = Field(default_factory=list)
+    manually_edited: bool = Field(
+        default=False, 
+        description="Provenance marker: True if manual edits occurred post-generation"
+    )
+    edited_fields: Optional[dict] = Field(
+        default=None, 
+        description="Tracks modified fields when manually_edited is True"
+    )
