@@ -113,3 +113,19 @@ class DocumentRecord(BaseModel):
         default=None, 
         description="Tracks modified fields when manually_edited is True"
     )
+class SelectedExperience(BaseModel):
+    experience_id: str
+    bullet_ids: List[str]
+
+class SelectedProject(BaseModel):
+    project_id: str
+    bullet_ids: List[str]
+
+class CVSelection(BaseModel):
+    """Output contract for LLM bullet and skill selection (FR-8)."""
+    language: Literal["en", "fr"]
+    target_role: str
+    skill_ids: List[str] = Field(description="Selected skill IDs ordered by relevance.")
+    experiences: List[SelectedExperience] = Field(description="Selected experience blocks and their chosen bullet IDs.")
+    projects: List[SelectedProject] = Field(default_factory=list, description="Selected project IDs and their chosen bullet IDs.")
+    education_ids: List[str] = Field(default_factory=list, description="Selected education IDs.")
