@@ -76,3 +76,38 @@ def mark_manually_edited(doc_id: int):
     cursor.execute('UPDATE generated_documents SET manually_edited = 1 WHERE id = ?', (doc_id,))
     conn.commit()
     conn.close()
+def delete_document_record(doc_id: int, remove_files: bool = True) -> bool:
+    """Deletes an audit record from SQLite and optionally unlinks its files on disk."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT pdf_path, tex_path FROM generated_documents WHERE id = ?", (doc_id,))
+    row = cursor.fetchone()
+
+    if not row:
+        conn.close()
+        return False
+
+    pdf_path, tex_path = row
+    if remove_files:
+        for filepath in (pdf_path, tex_path):
+            if filepath and os.path.exists(filepath):
+                try:
+                    os.remove(filepath)
+                except OSError:
+                    pass
+
+    cursor.execute("DELETE FROM generated_documents WHERE id = ?", (doc_id,))
+    conn.commit()
+    conn.close()
+    return True
+
+def clear_all_history(remove_files: bool = True):
+    """Clears all audit logs and deletes the output files."""
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM generated_documents")
+    rows = cursor.fetchall()
+    conn.close()
+
+    for (doc_id,) in rows:
+        delete_document_record(doc_id, remove_files=remove_files)

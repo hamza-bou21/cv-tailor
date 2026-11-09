@@ -1,6 +1,7 @@
 from pydantic import BaseModel, Field
 from typing import List, Optional, Literal
 
+
 # ---------------------------------------------------------
 # 1. Master CV Models (Parsing the YAML)
 # ---------------------------------------------------------
@@ -40,28 +41,20 @@ class Experience(BaseModel):
     role: BilingualText
     start_date: str
     end_date: str
-    bullets: List[Bullet] = Field(default_factory=list) # <--- Update this line
+    bullets: List[Bullet] = Field(default_factory=list)
 
 class Project(BaseModel):
     id: str
     name: str
     url: Optional[str] = None
     description: BilingualText
-    bullets: List[Bullet] = Field(default_factory=list) # <--- Update this line
+    bullets: List[Bullet] = Field(default_factory=list)
 
 class Education(BaseModel):
     id: str
     institution: str
     degree: BilingualText
     graduation_year: str
-
-class MasterCV(BaseModel):
-    personal_info: PersonalInfo
-    facts: Facts 
-    skills: List[Skill]
-    experience: List[Experience]
-    projects: List[Project]
-    education: List[Education]
 
 
 # ---------------------------------------------------------
@@ -88,6 +81,7 @@ class VerificationReport(BaseModel):
     """The final verification result of the generated cover letter."""
     claims: List[CoverLetterClaim]
     unsupported_claims_found: bool
+
 class MasterCV(BaseModel):
     personal_info: PersonalInfo
     facts: Facts 
@@ -95,11 +89,12 @@ class MasterCV(BaseModel):
     experience: List[Experience] = Field(default_factory=list)
     projects: List[Project] = Field(default_factory=list)
     education: List[Education] = Field(default_factory=list)
+
 class DocumentRecord(BaseModel):
     """Schema tracking generated documents and provenance audit trails."""
     id: Optional[str] = None
     job_id: str
-    doc_type: Literal["cv", "letter"]
+    doc_type: Literal["cv", "cover_letter", "letter"]
     language: Literal["en", "fr"]
     pdf_path: str
     tex_path: str
@@ -113,6 +108,7 @@ class DocumentRecord(BaseModel):
         default=None, 
         description="Tracks modified fields when manually_edited is True"
     )
+
 class SelectedExperience(BaseModel):
     experience_id: str
     bullet_ids: List[str]
@@ -131,25 +127,21 @@ class CVSelection(BaseModel):
     education_ids: List[str] = Field(default_factory=list, description="Selected education IDs.")
 
 class CoverLetterSentence(BaseModel):
+    paragraph: int = Field(default=1, description="Paragraph index: 1, 2, 3, or 4.")
     text: str = Field(description="Sentence prose.")
     based_on: List[str] = Field(
         default_factory=list,
         description="IDs of skills, experience bullets, or projects justifying this sentence. Empty if purely conversational/greeting."
     )
 
-class CoverLetterParagraph(BaseModel):
-    sentences: List[CoverLetterSentence] = Field(
-        description="List of cited sentences forming a single coherent paragraph."
-    )
-
 class CoverLetterDraft(BaseModel):
-    """Schema provided to the LLM (pure content, no internal audit fields)."""
+    """Schema provided to the LLM (flat sentences array, zero nested paragraph objects)."""
     language: Literal["en", "fr"]
     company: str
     target_role: str
     salutation: str
-    paragraphs: List[CoverLetterParagraph] = Field(
-        description="List of 3 to 4 distinct paragraphs."
+    sentences: List[CoverLetterSentence] = Field(
+        description="All sentences of the letter in order, each tagged with its paragraph number (1 to 4)."
     )
     signoff: str
 

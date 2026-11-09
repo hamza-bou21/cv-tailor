@@ -1,8 +1,13 @@
 import os
 import json
+import time
+import re
+from typing import Literal
 import yaml
 from dotenv import load_dotenv
 from groq import Groq
+import pymupdf
+
 from models import (
     MasterCV, 
     FitAnalysis, 
@@ -11,14 +16,50 @@ from models import (
     SelectedProject,
     CoverLetter, 
     CoverLetterDraft,
-    CoverLetterParagraph,
     CoverLetterSentence
 )
-import re
-from typing import Literal
 
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+
+ALLOWLISTED_NUMERALS = {"one", "two", "three", "first", "second", "1", "2"}
+
+
+def _call_llm_json(
+    messages: list[dict],
+    schema: dict,
+    model: str,
+    temperature: float = 0.1,
+    max_attempts: int = 3,
+) -> dict:
+    """Calls Groq with retry/backoff and robust JSON parsing.
+
+    Retries on transient API errors and on malformed JSON payloads, raising a
+    clear RuntimeError if all attempts fail.
+    """
+    last_error: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = client.chat.completions.create(
+                model=model,
+                messages=messages,
+                response_format={"type": "json_object"},
+                temperature=temperature,
+            )
+            content = response.choices[0].message.content
+            return json.loads(content)
+        except json.JSONDecodeError as exc:
+            last_error = exc
+            print(f"[!] Malformed JSON from LLM (attempt {attempt}/{max_attempts}).")
+        except Exception as exc:  # network / rate-limit / API errors
+            last_error = exc
+            print(f"[!] LLM call failed (attempt {attempt}/{max_attempts}): {exc}")
+
+        if attempt < max_attempts:
+            time.sleep(min(2 ** (attempt - 1), 8))
+
+    raise RuntimeError(f"LLM call failed after {max_attempts} attempts: {last_error}")
+
 
 def load_master_cv(yaml_path: str = "master_cv.yaml") -> MasterCV:
     """Loads and validates the local Master CV YAML."""
@@ -27,6 +68,7 @@ def load_master_cv(yaml_path: str = "master_cv.yaml") -> MasterCV:
     with open(yaml_path, "r", encoding="utf-8") as f:
         data = yaml.safe_load(f)
     return MasterCV(**data)
+
 
 def analyze_job(job_text: str, master_cv: MasterCV, model: str = "openai/gpt-oss-120b") -> FitAnalysis:
     """
@@ -83,25 +125,22 @@ def analyze_job(job_text: str, master_cv: MasterCV, model: str = "openai/gpt-oss
     6. 'missing_keywords' must list keywords present in the job but absent from candidate's profile.
     """
 
-    response = client.chat.completions.create(
-        model=model,
+    response_dict = _call_llm_json(
         messages=[
             {"role": "system", "content": f"You are a strict evaluation engine. Output JSON matching schema: {json.dumps(schema)}"},
             {"role": "user", "content": prompt}
         ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
+        schema=schema,
+        model=model,
     )
-    
-    result_dict = json.loads(response.choices[0].message.content)
-    analysis = FitAnalysis(**result_dict)
-    return analysis
-ALLOWLISTED_NUMERALS = {"one", "two", "three", "first", "second", "1", "2"}
+    return FitAnalysis(**response_dict)
+
 
 def verify_skill_claims(claimed_skills: list[str], master_cv: MasterCV) -> list[str]:
     """FR-10a: Deterministic set check. Returns any unapproved skills."""
     valid_names = {s.en.lower() for s in master_cv.skills} | {s.fr.lower() for s in master_cv.skills}
     return [s for s in claimed_skills if s.lower() not in valid_names]
+
 
 def verify_citation_ids(cited_ids: list[str], master_cv: MasterCV) -> list[str]:
     """FR-10b: Validates that cited IDs actually exist in the Master CV."""
@@ -117,20 +156,51 @@ def verify_citation_ids(cited_ids: list[str], master_cv: MasterCV) -> list[str]:
 
     return [cid for cid in cited_ids if cid not in all_valid_ids]
 
+
+_NUMERAL_RE = re.compile(r'\d+(?:,\d+)*(?:\.\d+)?')
+
+
+def _extract_numerals(text: str) -> set[str]:
+    """Extracts numeric tokens and adds normalized variants (comma-free, integer part).
+
+    This tolerates formatting differences such as '1,000' vs '1000' or '30.0' vs '30'
+    so equivalent numbers are treated as the same value during verification.
+    """
+    variants: set[str] = set()
+    for token in _NUMERAL_RE.findall(text or ""):
+        variants.add(token)
+        comma_stripped = token.replace(",", "")
+        variants.add(comma_stripped)
+        # Integer part only, e.g. '30.0' -> '30' and '99.8' -> '99'
+        if "." in comma_stripped:
+            variants.add(comma_stripped.split(".")[0])
+    return variants
+
+
 def verify_numerals(text: str, master_cv: MasterCV) -> list[str]:
     """FR-10c: Deterministic regex check for numbers outside facts and allowlist."""
-    found_numbers = re.findall(r'\b\d+(?:,\d+)?(?:\.\d+)?\b', text)
+    found_numbers = _NUMERAL_RE.findall(text)
+
     valid_numbers = {
         str(v) for v in master_cv.facts.model_dump().values() if v is not None
     } | ALLOWLISTED_NUMERALS
 
-    # Also allow numbers that already appear naturally in your CV text
+    # Allow numbers appearing naturally in experience bullets (EN + FR)
     for exp in master_cv.experience:
         for b in exp.bullets:
-            valid_numbers.update(re.findall(r'\b\d+(?:,\d+)?(?:\.\d+)?\b', b.en))
-            valid_numbers.update(re.findall(r'\b\d+(?:,\d+)?(?:\.\d+)?\b', b.fr))
+            valid_numbers.update(_extract_numerals(b.en))
+            valid_numbers.update(_extract_numerals(b.fr))
 
-    return [num for num in found_numbers if num not in valid_numbers]
+    # Allow numbers appearing naturally in project bullets (EN + FR)
+    for proj in master_cv.projects:
+        for b in proj.bullets:
+            valid_numbers.update(_extract_numerals(b.en))
+            valid_numbers.update(_extract_numerals(b.fr))
+
+    # Normalize the candidate tokens too, so formatting differences don't cause false flags
+    return [num for num in found_numbers if not (_extract_numerals(num) & valid_numbers)]
+
+
 def select_cv_content(
     job_text: str,
     master_cv: MasterCV,
@@ -143,7 +213,6 @@ def select_cv_content(
     """
     schema = CVSelection.model_json_schema()
 
-    # Build a structured catalog containing only IDs and text in the requested language
     catalog = {
         "skills": [{"id": s.id, "name": getattr(s, language)} for s in master_cv.skills],
         "experience": [
@@ -194,20 +263,16 @@ def select_cv_content(
     5. target_role must be a concise title adapted to the job description (e.g. 'Senior Backend Engineer').
     """
 
-    response = client.chat.completions.create(
-        model=model,
+    data = _call_llm_json(
         messages=[
             {"role": "system", "content": f"You are a strict data selector. Output JSON matching schema: {json.dumps(schema)}"},
             {"role": "user", "content": prompt}
         ],
-        response_format={"type": "json_object"},
-        temperature=0.1,
+        schema=schema,
+        model=model,
     )
-
-    data = json.loads(response.choices[0].message.content)
     raw_selection = CVSelection(**data)
 
-    # Deterministic scrubbing: drop any IDs not present in master_cv
     valid_skill_ids = {s.id for s in master_cv.skills}
     valid_exp_ids = {exp.id: {b.id for b in exp.bullets} for exp in master_cv.experience}
     valid_proj_ids = {proj.id: {b.id for b in proj.bullets} for proj in master_cv.projects}
@@ -235,46 +300,43 @@ def select_cv_content(
 
     cleaned_education = [eid for eid in raw_selection.education_ids if eid in valid_edu_ids]
 
+    # Safety net: never ship a CV with zero experience. If the LLM selection was
+    # emptied by validation, fall back to every experience (with all its bullets).
+    if not cleaned_experiences and master_cv.experience:
+        print("[!] No experiences survived validation; falling back to all experiences.")
+        cleaned_experiences = [
+            SelectedExperience(experience_id=exp.id, bullet_ids=[b.id for b in exp.bullets])
+            for exp in master_cv.experience
+        ]
+
     return CVSelection(
-        language=raw_selection.language,
+        language=language,
         target_role=raw_selection.target_role,
         skill_ids=cleaned_skills,
         experiences=cleaned_experiences,
         projects=cleaned_projects,
         education_ids=cleaned_education
     )
-from models import (
-    MasterCV, 
-    FitAnalysis, 
-    CVSelection, 
-    SelectedExperience, 
-    SelectedProject,
-    CoverLetter, 
-    CoverLetterSentence
-)
+
 
 def verify_cover_letter(letter: CoverLetterDraft, master_cv: MasterCV) -> list[str]:
     """Runs deterministic verification on citations and numerals across all sentences."""
     errors = []
 
-    # 1. Check citation IDs across paragraphs
-    all_cited_ids = [
-        cid 
-        for p in letter.paragraphs 
-        for s in p.sentences 
-        for cid in s.based_on
-    ]
+    # 1. Check citation IDs
+    all_cited_ids = [cid for s in letter.sentences for cid in s.based_on]
     invalid_ids = verify_citation_ids(all_cited_ids, master_cv)
     if invalid_ids:
         errors.append(f"Invalid citation IDs referenced: {', '.join(invalid_ids)}")
 
     # 2. Check numerals across sentence text
-    full_text = " ".join(s.text for p in letter.paragraphs for s in p.sentences)
+    full_text = " ".join(s.text for s in letter.sentences)
     invalid_numerals = verify_numerals(full_text, master_cv)
     if invalid_numerals:
         errors.append(f"Fabricated numerals outside facts/allowlist: {', '.join(invalid_numerals)}")
 
     return errors
+
 
 def generate_cover_letter(
     job_text: str,
@@ -287,7 +349,6 @@ def generate_cover_letter(
     FR-9 & FR-10: Generates a tailored 3-4 paragraph cover letter where every factual claim
     cites a Master CV ID. Automatically triggers re-prompting if verification checks fail.
     """
-    # Use CoverLetterDraft schema so the model only outputs letter content
     schema = CoverLetterDraft.model_json_schema()
 
     catalog = {
@@ -325,31 +386,31 @@ CANDIDATE DATA & VALID IDs:
 JOB DESCRIPTION:
 \"\"\"{job_text}\"\"\"
 
-CRITICAL HONESTY RULES:
-1. Every sentence making a factual statement (experience, metrics, tooling) MUST populate 'based_on' with valid IDs from the candidate data.
-2. If a sentence is an opening greeting, transition, or closing signoff, 'based_on' must be an empty list [].
-3. DO NOT invent metrics or numbers. Only use numbers present in the documented facts or bullets.
-4. DO NOT reference technologies or skills not listed in the candidate data.
-5. Provide 3 to 4 paragraphs in total.
+CRITICAL HONESTY & FORMAT RULES:
+1. Provide the letter as a flat array of 'sentences'. Tag each sentence with its 'paragraph' number (1, 2, 3, or 4).
+2. Every sentence making a factual statement (experience, metrics, tooling) MUST populate 'based_on' with valid IDs from candidate data.
+3. If a sentence is an opening greeting, transition, or closing signoff, 'based_on' must be an empty list [].
+4. DO NOT invent metrics or numbers. Only use numbers present in the candidate facts or bullets.
+5. DO NOT reference technologies or skills not listed in the candidate data.
 """
 
     messages = [
         {"role": "system", "content": f"You are a strict technical writer with zero-hallucination constraints. Output JSON matching schema: {json.dumps(schema)}"},
-        {"role": "user", "content": base_prompt}
+                {"role": "user", "content": base_prompt}
     ]
 
     for attempt in range(max_retries + 1):
-        response = client.chat.completions.create(
-            model=model,
+        raw_content = None
+        data = _call_llm_json(
             messages=messages,
-            response_format={"type": "json_object"},
-            temperature=0.1,
+            schema=schema,
+            model=model,
         )
+        # Keep a serialized copy so we can echo it back as the assistant turn on retries.
+        raw_content = json.dumps(data)
 
-        data = json.loads(response.choices[0].message.content)
         draft = CoverLetterDraft(**data)
 
-        # Run deterministic verification in Python
         errors = verify_cover_letter(draft, master_cv)
 
         if not errors:
@@ -365,7 +426,62 @@ Your previous output failed automated fact-checking checks with the following vi
 Rewrite the cover letter to completely resolve these violations.
 Ensure every cited ID strictly matches an ID from the candidate catalog, and remove or correct any fabricated numerals.
 """
-            messages.append({"role": "assistant", "content": response.choices[0].message.content})
+            messages.append({"role": "assistant", "content": raw_content})
             messages.append({"role": "user", "content": correction_instruction})
 
     return CoverLetter(**draft.model_dump(), verification_passed=False, verification_warnings=errors)
+
+
+def extract_text_from_pdf(pdf_source: bytes | str) -> str:
+    """Extracts raw text from a PDF file path or raw bytes buffer."""
+    if isinstance(pdf_source, (bytes, bytearray)):
+        doc = pymupdf.open(stream=pdf_source, filetype="pdf")
+    else:
+        doc = pymupdf.open(pdf_source)
+    
+    extracted_text = "\n".join(page.get_text() for page in doc)
+    doc.close()
+    return extracted_text.strip()
+
+
+def parse_pdf_to_master_cv(
+    pdf_text: str, 
+    model: str = "openai/gpt-oss-120b"
+) -> MasterCV:
+    """
+    Parses unstructured CV text into a verified MasterCV object.
+    Generates unique ID slugs for every item and provides bilingual EN/FR fields.
+    """
+    schema = MasterCV.model_json_schema()
+
+    prompt = f"""
+You are an expert ATS data engineer. Convert this unstructured resume into a Master CV YAML definition.
+
+RESUME TEXT:
+\"\"\"{pdf_text}\"\"\"
+
+EXTRACTION REQUIREMENTS:
+1. PERSONAL INFO: Name, email, phone, location, linkedin, github.
+2. SKILLS: Every single technical tool, language, or framework with id 'sk_<name>'.
+3. EXPERIENCE: You MUST extract all work experience entries. For each role, provide 1-3 achievement bullets with realistic French ('fr') translations alongside English ('en').
+4. PROJECTS: If the candidate lists academic or personal projects, extract them under 'projects'.
+5. EDUCATION: You MUST extract degree, institution name, and graduation year under 'education'.
+6. Do NOT leave 'experience' or 'education' empty if there is any mention of work, study, or degrees in the text.
+"""
+
+    data = _call_llm_json(
+        messages=[
+            {"role": "system", "content": f"You are a strict data transformation engine. Output JSON matching schema: {json.dumps(schema)}"},
+            {"role": "user", "content": prompt}
+        ],
+        schema=schema,
+        model=model,
+    )
+    return MasterCV(**data)
+
+
+def save_master_cv(cv: MasterCV, target_path: str):
+    """Saves a MasterCV instance to a formatted YAML file."""
+    os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
+    with open(target_path, "w", encoding="utf-8") as f:
+        yaml.dump(cv.model_dump(), f, sort_keys=False, allow_unicode=True, default_flow_style=False)

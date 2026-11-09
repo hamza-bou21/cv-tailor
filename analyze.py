@@ -29,6 +29,16 @@ def parse_args():
         action="store_true",
         help="Also generate a verified, tailored cover letter"
     )
+    parser.add_argument(
+        "--company",
+        default="",
+        help="Company name for the audit log (default: empty)"
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Generate CV/letter even if the fit verdict is SKIP"
+    )
     return parser.parse_args()
 
 
@@ -69,11 +79,20 @@ def main():
     for g in analysis.gaps:
         print(f"  • {g}")
 
-    print("\n[✓] Covered Keywords:", ", ".join(analysis.covered_keywords))
-    print("[✗] Missing Keywords:", ", ".join(analysis.missing_keywords))
+    print_covered = ", ".join(analysis.covered_keywords)
+    print_missing = ", ".join(analysis.missing_keywords)
+    print("\n[✓] Covered Keywords:", print_covered)
+    print("[✗] Missing Keywords:", print_missing)
 
-    if analysis.verdict in ("apply", "stretch"):
-        print(f"\nSelecting and ranking CV content ({args.lang.upper()})...")
+    if analysis.verdict not in ("apply", "stretch") and not args.force:
+        print("\n[!] Verdict is SKIP: Skipping CV and letter generation (no --force).")
+        return
+
+    if analysis.verdict == "skip" and args.force:
+        print("\n[!] Verdict is SKIP, but proceeding due to --force override.")
+    print(f"\nSelecting and ranking CV content ({args.lang.upper()})...")
+
+    try:
         selection = select_cv_content(job_text, cv, language=args.lang)
 
         print("\n" + "=" * 44)
@@ -98,10 +117,10 @@ def main():
         print("\nCompiling single-page CV PDF...")
         cv_pdf = compile_to_single_page(selection, cv, output_dir="output", job_name="tailored_cv")
         cv_tex = os.path.join("output", "tailored_cv.tex")
-        
+
         cv_id = log_document(
             job_title=selection.target_role,
-            company="CloudNext",
+            company=args.company,
             fit_score=analysis.fit_score,
             verdict=analysis.verdict,
             pdf_path=cv_pdf,
@@ -127,7 +146,7 @@ def main():
             warnings_str = ", ".join(letter.verification_warnings) if letter.verification_warnings else None
             letter_id = log_document(
                 job_title=letter.target_role,
-                company=letter.company,
+                company=letter.company or args.company,
                 fit_score=analysis.fit_score,
                 verdict=analysis.verdict,
                 pdf_path=letter_pdf,
@@ -137,8 +156,9 @@ def main():
                 warnings=warnings_str
             )
             print(f"[Done] Cover Letter PDF: {letter_pdf} (Audit Log ID: {letter_id})")
-    else:
-        print("\n[!] Verdict is SKIP: Skipping CV and letter generation.")
+    except Exception as e:
+        print(f"\n[Error] Generation failed: {e}", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

@@ -2,9 +2,12 @@ import os
 import re
 import shutil
 import subprocess
-import pymupdf
+import datetime
+from collections import defaultdict
 from typing import Optional
-from models import MasterCV, CVSelection
+
+import pymupdf
+from models import MasterCV, CVSelection, CoverLetter
 
 LATEX_ESCAPE_MAP = {
     "&": r"\&",
@@ -18,12 +21,14 @@ LATEX_ESCAPE_MAP = {
     "^": r"\textasciicircum{}",
 }
 
+
 def escape_latex(text: str) -> str:
     """Escapes special LaTeX characters in plain text strings."""
     if not text:
         return ""
     regex = re.compile("|".join(re.escape(k) for k in LATEX_ESCAPE_MAP.keys()))
     return regex.sub(lambda match: LATEX_ESCAPE_MAP[match.group(0)], text)
+
 
 def find_pdflatex_binary() -> str:
     """Locates pdflatex from PATH or default Windows installation paths."""
@@ -42,132 +47,155 @@ def find_pdflatex_binary() -> str:
 
     raise EnvironmentError("pdflatex executable was not found. Please ensure MiKTeX or TeX Live is installed.")
 
+
 def render_cv_latex(selection: CVSelection, master_cv: MasterCV) -> str:
-    """Generates clean, ATS-compliant LaTeX code from selected CV items."""
+    """Generates a polished, ATS-compliant LaTeX CV styled after the reference template."""
     lang = selection.language
     p_info = master_cv.personal_info
-    
-    # 1. Header Section
+
+    # 1. Header / Preamble (mirrors reference main.tex styling)
     header = rf"""\documentclass[10pt,a4paper]{{article}}
-\usepackage[utf8]{{inputenc}}
 \usepackage[margin=0.6in]{{geometry}}
+\usepackage[T1]{{fontenc}}
+\usepackage[hidelinks]{{hyperref}}
 \usepackage{{enumitem}}
-\usepackage{{hyperref}}
 \usepackage{{titlesec}}
 
-\hypersetup{{
-    colorlinks=true,
-    linkcolor=black,
-    urlcolor=blue
-}}
-
-\titleformat{{\section}}{{\large\bfseries\uppercase}}{{}}{{0em}}{{}}[\titlerule]
-\titlespacing*{{\section}}{{0pt}}{{8pt}}{{4pt}}
-\setlist[itemize]{{leftmargin=1.2em, itemsep=1pt, topsep=2pt, parsep=0pt}}
 \pagestyle{{empty}}
+\setlength{{\parindent}}{{0pt}}
+\setlist[itemize]{{leftmargin=1.2em, itemsep=1pt, topsep=2pt, parsep=0pt}}
+
+\titleformat{{\section}}{{\large\bfseries}}{{}}{{0pt}}{{}}[\titlerule]
+\titlespacing*{{\section}}{{0pt}}{{8pt}}{{4pt}}
+
+\newcommand{{\role}}[3]{{\textbf{{#1}} \hfill #3 \\ \textit{{#2}}}}
 
 \begin{{document}}
 
+% ---------- HEADER ----------
 \begin{{center}}
-    {{\LARGE \textbf{{{escape_latex(p_info.name)}}}}} \\[3pt]
-    \href{{mailto:{p_info.email}}}{{{escape_latex(p_info.email)}}} $|$ 
-    \href{{https://{p_info.linkedin}}}{{{escape_latex(p_info.linkedin)}}} $|$ 
-    \href{{https://{p_info.github}}}{{{escape_latex(p_info.github)}}}
+{{\LARGE \textbf{{{escape_latex(p_info.name)}}}}}\\[3pt]
+{{\large {escape_latex(selection.target_role)}}}\\[3pt]
+\href{{mailto:{escape_latex(p_info.email)}}}{{{escape_latex(p_info.email)}}} \ \ $|$ \ \ 
+\href{{https://{escape_latex(p_info.linkedin)}}}{{{escape_latex(p_info.linkedin)}}} \ \ $|$ \ \ 
+\href{{https://{escape_latex(p_info.github)}}}{{{escape_latex(p_info.github)}}}
 \end{{center}}
-\vspace{{-8pt}}
 """
 
-    # 2. Selected Skills Section
+    # 2. Selected Skills (flat, comma-separated flowing line)
     skills_map = {s.id: getattr(s, lang) for s in master_cv.skills}
     chosen_skills = [escape_latex(skills_map[sid]) for sid in selection.skill_ids if sid in skills_map]
-    
+
     skills_title = "Compétences Techniques" if lang == "fr" else "Technical Skills"
+    skills_body = ", ".join(chosen_skills)
     skills_section = rf"""
+% ---------- SKILLS ----------
 \section*{{{skills_title}}}
-\noindent {", ".join(chosen_skills)}
+{skills_body}
 """
 
-    # 3. Selected Experience Section
+    # 3. Selected Experience
     exp_title = "Expérience Professionnelle" if lang == "fr" else "Work Experience"
     exp_lookup = {e.id: e for e in master_cv.experience}
     exp_blocks = []
 
-    for sel_exp in selection.experiences:
+    for idx, sel_exp in enumerate(selection.experiences):
         if sel_exp.experience_id not in exp_lookup:
             continue
         exp = exp_lookup[sel_exp.experience_id]
         role_title = getattr(exp.role, lang)
-        
+        org_line = exp.company
+        if exp.location:
+            org_line = f"{exp.company}, {exp.location}"
+        date_line = f"{exp.start_date} -- {exp.end_date}"
+
         bullet_lookup = {b.id: getattr(b, lang) for b in exp.bullets}
         bullet_items = []
         for bid in sel_exp.bullet_ids:
             if bid in bullet_lookup:
-                bullet_items.append(rf"\item {escape_latex(bullet_lookup[bid])}")
+                bullet_items.append(rf"  \item {escape_latex(bullet_lookup[bid])}")
 
-        bullets_latex = "\n        ".join(bullet_items)
-        block = rf"""
-\noindent \textbf{{{escape_latex(role_title)}}} \hfill \textbf{{{escape_latex(exp.company)}}} \\
-\textit{{{escape_latex(exp.start_date)} -- {escape_latex(exp.end_date)}}} \hfill \textit{{{escape_latex(exp.location)}}}
+        bullets_latex = "\n".join(bullet_items)
+        sep = "\n\\vspace{3pt}" if idx > 0 else ""
+        block = rf"""{sep}
+\role{{{escape_latex(role_title)}}}{{{escape_latex(org_line)}}}{{{escape_latex(date_line)}}}
 \begin{{itemize}}
-        {bullets_latex}
-\end{{itemize}}
-\vspace{{2pt}}"""
+{bullets_latex}
+\end{{itemize}}"""
         exp_blocks.append(block)
 
     experience_section = rf"""
+% ---------- EXPERIENCE ----------
 \section*{{{exp_title}}}
 {"".join(exp_blocks)}
 """
 
-    # 4. Selected Projects Section
+    # 4. Selected Projects
     proj_section = ""
     if selection.projects:
         proj_title = "Projets" if lang == "fr" else "Projects"
         proj_lookup = {p.id: p for p in master_cv.projects}
         proj_blocks = []
 
-        for sel_proj in selection.projects:
+        for idx, sel_proj in enumerate(selection.projects):
             if sel_proj.project_id not in proj_lookup:
                 continue
             proj = proj_lookup[sel_proj.project_id]
             desc = getattr(proj.description, lang)
-            
+
+            # Linked project name if a URL exists, otherwise plain bold name.
+            if proj.url:
+                name_latex = rf"\href{{{proj.url}}}{{\textbf{{{escape_latex(proj.name)}}}}}"
+            else:
+                name_latex = rf"\textbf{{{escape_latex(proj.name)}}}"
+
             bullet_lookup = {b.id: getattr(b, lang) for b in proj.bullets}
             bullet_items = [
-                rf"\item {escape_latex(bullet_lookup[bid])}"
+                rf"  \item {escape_latex(bullet_lookup[bid])}"
                 for bid in sel_proj.bullet_ids if bid in bullet_lookup
             ]
-            bullets_latex = f"\n\\begin{{itemize}}\n        {''.join(bullet_items)}\n\\end{{itemize}}" if bullet_items else ""
+            bullets_latex = ""
+            if bullet_items:
+                bullets_latex = "\n\\begin{itemize}\n" + "\n".join(bullet_items) + "\n\\end{itemize}"
 
-            p_block = rf"""
-\noindent \textbf{{{escape_latex(proj.name)}}} $|$ \textit{{{escape_latex(desc)}}} {bullets_latex}
-\vspace{{2pt}}"""
+            sep = "\n\\vspace{3pt}" if idx > 0 else ""
+            p_block = rf"""{sep}
+{name_latex} \textit{{({escape_latex(desc)})}}{bullets_latex}"""
             proj_blocks.append(p_block)
 
         proj_section = rf"""
+% ---------- PROJECTS ----------
 \section*{{{proj_title}}}
 {"".join(proj_blocks)}
 """
 
-    # 5. Education Section
+    # 5. Education (inline degree, institution -- dates), respecting selection order
     edu_title = "Formation" if lang == "fr" else "Education"
+    edu_lookup = {e.id: e for e in master_cv.education}
+
+    # Preserve the ranked order from the selection; fall back to all if none selected.
+    ordered_edu_ids = [eid for eid in selection.education_ids if eid in edu_lookup]
+    if not ordered_edu_ids:
+        ordered_edu_ids = list(edu_lookup.keys())
+
     edu_blocks = []
-    for edu in master_cv.education:
+    for eid in ordered_edu_ids:
+        edu = edu_lookup[eid]
         degree_name = getattr(edu.degree, lang)
         edu_blocks.append(
-            rf"\noindent \textbf{{{escape_latex(edu.institution)}}} \hfill {escape_latex(edu.graduation_year)} \\"
-            rf"\textit{{{escape_latex(degree_name)}}}"
+            rf"\textbf{{{escape_latex(degree_name)}}}, {escape_latex(edu.institution)} \hfill {escape_latex(edu.graduation_year)}"
         )
 
-    # Join outside of the f-string curly braces to comply with Python 3.11 syntax
-    edu_body = "\n\\vspace{2pt}\n".join(edu_blocks)
+    edu_body = "\\\\\n".join(edu_blocks)
     education_section = rf"""
+% ---------- EDUCATION ----------
 \section*{{{edu_title}}}
 {edu_body}
 """
 
-    footer = r"\end{document}"
-    return header + skills_section + experience_section + proj_section + education_section + footer
+    footer = "\n\\end{document}\n"
+    return header + experience_section + proj_section + education_section + skills_section + footer
+
 
 def compile_latex(tex_code: str, output_dir: str = "output", job_name: str = "cv") -> tuple[str, int]:
     """Compiles LaTeX code to PDF using pdflatex. Returns (pdf_path, page_count)."""
@@ -196,6 +224,7 @@ def compile_latex(tex_code: str, output_dir: str = "output", job_name: str = "cv
     doc.close()
 
     return pdf_path, page_count
+
 
 def compile_to_single_page(
     selection: CVSelection, 
@@ -238,11 +267,9 @@ def compile_to_single_page(
 
     return pdf_path
 
-from models import CoverLetter
-import datetime
 
 def render_letter_latex(letter: CoverLetter, master_cv: MasterCV) -> str:
-    """Renders a formal ATS-compliant LaTeX cover letter."""
+    """Renders a formal ATS-compliant LaTeX cover letter from flat sentence records."""
     p_info = master_cv.personal_info
     current_date = datetime.date.today().strftime("%B %d, %Y")
 
@@ -284,15 +311,19 @@ def render_letter_latex(letter: CoverLetter, master_cv: MasterCV) -> str:
 
 """
 
-    # Assemble paragraphs from sentences
+    # Group flat sentences by their paragraph number
+    para_dict = defaultdict(list)
+    for s in letter.sentences:
+        if s.text.strip():
+            para_dict[s.paragraph].append(s.text.strip())
+
     body_paragraphs = []
-    for paragraph in letter.paragraphs:
-        paragraph_text = " ".join(s.text.strip() for s in paragraph.sentences if s.text.strip())
+    for p_num in sorted(para_dict.keys()):
+        paragraph_text = " ".join(para_dict[p_num])
         body_paragraphs.append(escape_latex(paragraph_text))
 
     body_latex = "\n\n".join(body_paragraphs)
 
-    # Clean signoff so it never duplicates the candidate's name
     clean_signoff = letter.signoff.split(",")[0].strip()
     if letter.signoff.lower().replace(",", "").strip().endswith(p_info.name.lower()):
         clean_signoff = "Sincerely"
@@ -307,6 +338,7 @@ def render_letter_latex(letter: CoverLetter, master_cv: MasterCV) -> str:
 """
 
     return header + body_latex + footer
+
 
 def compile_letter_pdf(
     letter: CoverLetter, 
