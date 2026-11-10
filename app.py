@@ -84,6 +84,19 @@ st.title("📄 CV Tailor & Audit Engine")
 st.caption("Deterministic CV tailoring, PDF-to-YAML parsing, and tamper-evident provenance.")
 
 # Sidebar Configuration
+st.sidebar.header("🔑 API Configuration")
+api_key = st.sidebar.text_input(
+    "Groq API Key:",
+    type="password",
+    placeholder="gsk_...",
+    help="Pasted keys are held only in this session's memory and used per request. They are never written to disk.",
+)
+if api_key and api_key.strip():
+    st.sidebar.success("API key provided.")
+else:
+    st.sidebar.info("A Groq API key is required to analyze or generate documents.")
+
+st.sidebar.divider()
 st.sidebar.header("Active Profile")
 available_profiles = get_available_profiles()
 
@@ -153,12 +166,14 @@ with tab_tailor:
             run_button = st.button("🚀 Analyze & Generate Documents", type="primary", use_container_width=True)
 
             if run_button:
-                if not job_text.strip():
+                if not api_key or not api_key.strip():
+                    st.error("Please enter your Groq API key in the sidebar before analyzing.")
+                elif not job_text.strip():
                     st.error("Please provide a job description.")
                 else:
                     try:
                         with st.spinner("Analyzing job fit against Master CV..."):
-                            analysis = analyze_job(job_text, master_cv)
+                            analysis = analyze_job(job_text, master_cv, api_key=api_key)
                             st.session_state.last_analysis = analysis
 
                         # --- Check Skip Gatekeeper with Force Override ---
@@ -173,7 +188,7 @@ with tab_tailor:
                             st.session_state.generated_letter = None
 
                             with st.spinner("Selecting & ranking CV items deterministically..."):
-                                selection = select_cv_content(job_text, master_cv, language=language)
+                                selection = select_cv_content(job_text, master_cv, api_key=api_key, language=language)
 
                             with st.spinner("Compiling LaTeX to single-page PDF..."):
                                 run_tag = time.time_ns()
@@ -202,7 +217,7 @@ with tab_tailor:
 
                             if generate_letter_flag:
                                 with st.spinner("Writing and verifying cited cover letter..."):
-                                    letter = generate_cover_letter(job_text, master_cv, language=language)
+                                    letter = generate_cover_letter(job_text, master_cv, api_key=api_key, language=language)
                                     letter_job_name = f"cover_letter_{run_tag}"
                                     letter_pdf = compile_letter_pdf(letter, master_cv, output_dir="output", job_name=letter_job_name)
                                     letter_tex = os.path.join("output", f"{letter_job_name}.tex")
@@ -293,7 +308,9 @@ with tab_sources:
         new_profile_slug = st.text_input("Target Profile Name (e.g. john_doe):", value="")
 
         if st.button("⚙️ Extract & Generate YAML Profile", type="primary", use_container_width=True):
-            if not uploaded_pdf:
+            if not api_key or not api_key.strip():
+                st.error("Please enter your Groq API key in the sidebar before extracting a profile.")
+            elif not uploaded_pdf:
                 st.error("Please upload a PDF file first.")
             elif not new_profile_slug.strip():
                 st.error("Please enter a profile name.")
@@ -311,7 +328,7 @@ with tab_sources:
                             if len(extracted_raw_text) < 50:
                                 st.error("Could not extract sufficient text from PDF. Ensure it is not a scanned image.")
                             else:
-                                parsed_cv = parse_pdf_to_master_cv(extracted_raw_text)
+                                parsed_cv = parse_pdf_to_master_cv(extracted_raw_text, api_key=api_key)
                                 clean_filename = f"{slug}.yaml"
                                 save_path = os.path.join(PROFILES_DIR, clean_filename)
                                 save_master_cv(parsed_cv, save_path)

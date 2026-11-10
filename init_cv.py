@@ -1,97 +1,76 @@
 import os
-import json
-import yaml
-import pymupdf as fitz
-from dotenv import load_dotenv
-from groq import Groq
-from models import MasterCV
 import sys
 
+import pymupdf
 
-load_dotenv()
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+from core import extract_text_from_pdf, parse_pdf_to_master_cv, save_master_cv
 
-def extract_pdf_data(pdf_path: str) -> str:
-    """Reads a PDF and extracts both text and embedded hyperlinks."""
+
+def extract_hyperlinks(pdf_path: str) -> list[str]:
+    """Extracts embedded hyperlink URIs from a PDF (unique, order-preserving)."""
+    links: list[str] = []
+    seen: set[str] = set()
+    doc = pymupdf.open(pdf_path)
+    try:
+        for page in doc:
+            for link in page.get_links():
+                uri = link.get("uri")
+                if uri and uri not in seen:
+                    seen.add(uri)
+                    links.append(uri)
+    finally:
+        doc.close()
+    return links
+
+
+def extract_cv_to_yaml(
+    pdf_path: str, api_key: str, output_path: str = "master_cv.yaml"
+) -> None:
+    """Extracts a PDF CV, builds a MasterCV via the shared core pipeline, and saves it as YAML."""
     print(f"Reading {pdf_path}...")
-    doc = fitz.open(pdf_path)
-    
-    full_text = ""
-    all_links = set()
-    
-    for page in doc:
-        full_text += page.get_text()
-        
-        # Extract hidden hyperlinks from the page
-        links = page.get_links()
-        for link in links:
-            if 'uri' in link:
-                all_links.add(link['uri'])
-                
-    doc.close()
-    
-    # Combine the text and the links so the AI has everything
-    combined_content = f"--- CV TEXT ---\n{full_text}\n\n--- EXTRACTED HYPERLINKS ---\n"
-    for link in all_links:
-        combined_content += f"- {link}\n"
-        
-    return combined_content
+    raw_text = extract_text_from_pdf(pdf_path)
+    hyperlinks = extract_hyperlinks(pdf_path)
 
-def extract_cv_to_yaml(pdf_path: str, output_path: str = "master_cv.yaml"):
-    raw_content = extract_pdf_data(pdf_path)
-    print("Sending PDF text and links to Groq for extraction...")
-    
-    schema = MasterCV.model_json_schema()
-    
-    prompt = f"""
-    You are an expert CV data extractor. Parse the following CV text and the list of extracted 
-    hyperlinks, and convert them STRICTLY into the provided JSON schema. 
-    
-    RULES:
-    1. Match the extracted hyperlinks to the correct fields (LinkedIn, GitHub, Portfolio, Project URLs).
-    2. Generate unique IDs for all skills, experience bullets, projects, and education.
-    3. For any field requiring `BilingualText` (en/fr), provide the original English and a professional French translation.
-    4. Extract concrete metrics (years of experience, etc.) into the `facts` block.
-    
-    RAW DATA:
-    {raw_content}
-    """
-
-    response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
-        messages=[
-            {"role": "system", "content": f"You are a helpful assistant that outputs JSON matching this schema: {json.dumps(schema)}"},
-            {"role": "user", "content": prompt}
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.2,
+    combined_content = (
+        raw_text if raw_text.strip() else "(no extractable text found in PDF)"
     )
-    
-    data_dict = json.loads(response.choices[0].message.content)
-    
-    print("Validating AI output against Pydantic models...")
-    validated_cv = MasterCV(**data_dict)
-    
+
+    if hyperlinks:
+        link_block = "\n".join(f"- {link}" for link in hyperlinks)
+        combined_content += f"\n\n--- EXTRACTED HYPERLINKS ---\n{link_block}"
+
+    if len(raw_text.strip()) < 50:
+        print("Warning: Very little text was extracted. The CV may be a scanned image.")
+
+    print("Sending PDF text and links to Groq for extraction...")
+    validated_cv = parse_pdf_to_master_cv(combined_content, api_key=api_key)
+
     print(f"Validation successful! Writing to {output_path}...")
-    with open(output_path, "w", encoding="utf-8") as f:
-        yaml.dump(validated_cv.model_dump(exclude_none=True), f, allow_unicode=True, sort_keys=False)
-        
+    save_master_cv(validated_cv, output_path)
+
     print("Done! Your new Master CV database is ready.")
 
 
 if __name__ == "__main__":
-    # Check if the user provided a file path in the terminal
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key or not api_key.strip():
+        print(
+            "Error: GROQ_API_KEY environment variable is not set.\n"
+            "Set it before running, e.g.:\n"
+            "  PowerShell:  $env:GROQ_API_KEY = 'gsk_...'\n"
+            "  bash/zsh:    export GROQ_API_KEY='gsk_...'",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     if len(sys.argv) < 2:
         print("Usage: python init_cv.py <path_to_your_cv.pdf>")
         sys.exit(1)
-        
-    # Get the file path from the terminal argument
+
     pdf_file_path = sys.argv[1]
-    
-    # Check if the file actually exists before trying to read it
+
     if not os.path.exists(pdf_file_path):
         print(f"Error: Could not find the file '{pdf_file_path}'")
         sys.exit(1)
-        
-    # Run the extraction
-    extract_cv_to_yaml(pdf_file_path)
+
+    extract_cv_to_yaml(pdf_file_path, api_key)

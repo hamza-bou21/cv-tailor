@@ -20,7 +20,6 @@ from models import (
 )
 
 load_dotenv()
-client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
 ALLOWLISTED_NUMERALS = {"one", "two", "three", "first", "second", "1", "2"}
 
@@ -28,15 +27,22 @@ ALLOWLISTED_NUMERALS = {"one", "two", "three", "first", "second", "1", "2"}
 def _call_llm_json(
     messages: list[dict],
     schema: dict,
+    api_key: str,
     model: str,
     temperature: float = 0.1,
     max_attempts: int = 3,
 ) -> dict:
     """Calls Groq with retry/backoff and robust JSON parsing.
 
+    A fresh client is initialized per call from the caller-supplied ``api_key`` so
+    no key is ever baked into the module or shared across requests.
     Retries on transient API errors and on malformed JSON payloads, raising a
     clear RuntimeError if all attempts fail.
     """
+    if not api_key or not api_key.strip():
+        raise ValueError("A Groq API key is required to call the language model.")
+
+    client = Groq(api_key=api_key)
     last_error: Exception | None = None
     for attempt in range(1, max_attempts + 1):
         try:
@@ -70,7 +76,7 @@ def load_master_cv(yaml_path: str = "master_cv.yaml") -> MasterCV:
     return MasterCV(**data)
 
 
-def analyze_job(job_text: str, master_cv: MasterCV, model: str = "openai/gpt-oss-120b") -> FitAnalysis:
+def analyze_job(job_text: str, master_cv: MasterCV, api_key: str, model: str = "openai/gpt-oss-120b") -> FitAnalysis:
     """
     Performs the fit analysis between the job description and the Master CV.
     Enforces FR-6: Validates against FitAnalysis schema and discards invalid data.
@@ -122,7 +128,7 @@ def analyze_job(job_text: str, master_cv: MasterCV, model: str = "openai/gpt-oss
     3. 'strengths' must only reference verified candidate capabilities.
     4. 'gaps' must list unmet job requirements.
     5. 'covered_keywords' must only include keywords the candidate demonstrably has.
-    6. 'missing_keywords' must list keywords present in the job but absent from candidate's profile.
+        6. 'missing_keywords' must list keywords present in the job but absent from candidate's profile.
     """
 
     response_dict = _call_llm_json(
@@ -131,6 +137,7 @@ def analyze_job(job_text: str, master_cv: MasterCV, model: str = "openai/gpt-oss
             {"role": "user", "content": prompt}
         ],
         schema=schema,
+        api_key=api_key,
         model=model,
     )
     return FitAnalysis(**response_dict)
@@ -204,6 +211,7 @@ def verify_numerals(text: str, master_cv: MasterCV) -> list[str]:
 def select_cv_content(
     job_text: str,
     master_cv: MasterCV,
+    api_key: str,
     language: Literal["en", "fr"] = "en",
     model: str = "openai/gpt-oss-120b"
 ) -> CVSelection:
@@ -260,7 +268,7 @@ def select_cv_content(
     2. Rank skill_ids strictly from most relevant to least relevant.
     3. For each experience, select only bullets that demonstrate relevant impact, ranked by relevance.
     4. Select up to 2-3 most relevant projects.
-    5. target_role must be a concise title adapted to the job description (e.g. 'Senior Backend Engineer').
+        5. target_role must be a concise title adapted to the job description (e.g. 'Senior Backend Engineer').
     """
 
     data = _call_llm_json(
@@ -269,6 +277,7 @@ def select_cv_content(
             {"role": "user", "content": prompt}
         ],
         schema=schema,
+        api_key=api_key,
         model=model,
     )
     raw_selection = CVSelection(**data)
@@ -341,6 +350,7 @@ def verify_cover_letter(letter: CoverLetterDraft, master_cv: MasterCV) -> list[s
 def generate_cover_letter(
     job_text: str,
     master_cv: MasterCV,
+    api_key: str,
     language: Literal["en", "fr"] = "en",
     model: str = "openai/gpt-oss-120b",
     max_retries: int = 2
@@ -396,7 +406,7 @@ CRITICAL HONESTY & FORMAT RULES:
 
     messages = [
         {"role": "system", "content": f"You are a strict technical writer with zero-hallucination constraints. Output JSON matching schema: {json.dumps(schema)}"},
-                {"role": "user", "content": base_prompt}
+        {"role": "user", "content": base_prompt}
     ]
 
     for attempt in range(max_retries + 1):
@@ -404,6 +414,7 @@ CRITICAL HONESTY & FORMAT RULES:
         data = _call_llm_json(
             messages=messages,
             schema=schema,
+            api_key=api_key,
             model=model,
         )
         # Keep a serialized copy so we can echo it back as the assistant turn on retries.
@@ -446,6 +457,7 @@ def extract_text_from_pdf(pdf_source: bytes | str) -> str:
 
 def parse_pdf_to_master_cv(
     pdf_text: str, 
+    api_key: str,
     model: str = "openai/gpt-oss-120b"
 ) -> MasterCV:
     """
@@ -475,13 +487,20 @@ EXTRACTION REQUIREMENTS:
             {"role": "user", "content": prompt}
         ],
         schema=schema,
+        api_key=api_key,
         model=model,
     )
     return MasterCV(**data)
 
 
 def save_master_cv(cv: MasterCV, target_path: str):
-    """Saves a MasterCV instance to a formatted YAML file."""
+    """Saves a MasterCV instance to a formatted YAML file (null fields omitted)."""
     os.makedirs(os.path.dirname(os.path.abspath(target_path)), exist_ok=True)
     with open(target_path, "w", encoding="utf-8") as f:
-        yaml.dump(cv.model_dump(), f, sort_keys=False, allow_unicode=True, default_flow_style=False)
+        yaml.dump(
+            cv.model_dump(exclude_none=True),
+            f,
+            sort_keys=False,
+            allow_unicode=True,
+            default_flow_style=False,
+        )
