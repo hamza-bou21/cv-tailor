@@ -9,19 +9,160 @@ from groq import Groq
 import pymupdf
 
 from models import (
-    MasterCV, 
-    FitAnalysis, 
-    CVSelection, 
-    SelectedExperience, 
+    MasterCV,
+    FitAnalysis,
+    CVSelection,
+    SelectedExperience,
     SelectedProject,
-    CoverLetter, 
+    CoverLetter,
     CoverLetterDraft,
-    CoverLetterSentence
+    CoverLetterSentence,
 )
 
 load_dotenv()
 
 ALLOWLISTED_NUMERALS = {"one", "two", "three", "first", "second", "1", "2"}
+
+# Reference vocabulary of common technical skills/tools. Used to detect skills a
+# generated cover letter *claims* in prose so we can flag any that are NOT in the
+# candidate's Master CV (FR-10a honesty enforcement). This is intentionally not
+# exhaustive: it only needs to cover terms a model is likely to mention when
+# over-claiming. Matching is case-insensitive and word-boundary aware.
+COMMON_TECH_SKILLS = {
+    # Languages
+    "Python",
+    "Java",
+    "JavaScript",
+    "TypeScript",
+    "Go",
+    "Golang",
+    "Rust",
+    "C++",
+    "C#",
+    "Ruby",
+    "PHP",
+    "Scala",
+    "Kotlin",
+    "Swift",
+    "R",
+    "MATLAB",
+    "Perl",
+    "Elixir",
+    "Haskell",
+    "Clojure",
+    "Dart",
+    "Lua",
+    "Bash",
+    "Shell",
+    "SQL",
+    "HTML",
+    "CSS",
+    # Frameworks / libraries
+    "FastAPI",
+    "Flask",
+    "Django",
+    "Spring",
+    "Spring Boot",
+    "Express",
+    "NestJS",
+    "Node.js",
+    "Node",
+    "React",
+    "Vue",
+    "Angular",
+    "Next.js",
+    "Svelte",
+    "Rails",
+    "Ruby on Rails",
+    ".NET",
+    "ASP.NET",
+    "Laravel",
+    "GraphQL",
+    "gRPC",
+    "REST",
+    "Pandas",
+    "NumPy",
+    "PyTorch",
+    "TensorFlow",
+    "scikit-learn",
+    "Keras",
+    "Spark",
+    "Airflow",
+    "dbt",
+    "Kafka",
+    "RabbitMQ",
+    "Celery",
+    "Hibernate",
+    # Data stores
+    "PostgreSQL",
+    "MySQL",
+    "SQLite",
+    "MongoDB",
+    "Redis",
+    "Cassandra",
+    "DynamoDB",
+    "Elasticsearch",
+    "ClickHouse",
+    "Snowflake",
+    "BigQuery",
+    "Oracle",
+    "MariaDB",
+    "Neo4j",
+    "Memcached",
+    # Cloud / infra / devops
+    "AWS",
+    "GCP",
+    "Azure",
+    "Google Cloud",
+    "Docker",
+    "Kubernetes",
+    "Terraform",
+    "Ansible",
+    "Jenkins",
+    "GitHub Actions",
+    "GitLab CI",
+    "CircleCI",
+    "Helm",
+    "Prometheus",
+    "Grafana",
+    "Nginx",
+    "Linux",
+    "Unix",
+    "Vagrant",
+    "Pulumi",
+    "CloudFormation",
+    "Serverless",
+    "Lambda",
+    "EC2",
+    "S3",
+    "ECS",
+    "EKS",
+    # Practices / concepts
+    "CI/CD",
+    "TDD",
+    "Agile",
+    "Scrum",
+    "Kanban",
+    "Microservices",
+    "Monolith",
+    "Machine Learning",
+    "Deep Learning",
+    "NLP",
+    "Computer Vision",
+    "ETL",
+    "ELT",
+    "Data Warehouse",
+    "Data Lake",
+    "Streaming",
+    "Observability",
+    "DevOps",
+    "Verilog",
+    "VHDL",
+    "FPGA",
+    "Embedded",
+    "RTOS",
+    "PID",
+}
 
 
 def _call_llm_json(
@@ -76,13 +217,15 @@ def load_master_cv(yaml_path: str = "master_cv.yaml") -> MasterCV:
     return MasterCV(**data)
 
 
-def analyze_job(job_text: str, master_cv: MasterCV, api_key: str, model: str = "openai/gpt-oss-120b") -> FitAnalysis:
+def analyze_job(
+    job_text: str, master_cv: MasterCV, api_key: str, model: str = "openai/gpt-oss-120b"
+) -> FitAnalysis:
     """
     Performs the fit analysis between the job description and the Master CV.
     Enforces FR-6: Validates against FitAnalysis schema and discards invalid data.
     """
     schema = FitAnalysis.model_json_schema()
-    
+
     # 1. Format facts metrics
     facts_lines = []
     for k, v in master_cv.facts.model_dump().items():
@@ -102,7 +245,7 @@ def analyze_job(job_text: str, master_cv: MasterCV, api_key: str, model: str = "
             f"  • {exp.role.en} at {exp.company} ({exp.start_date} to {exp.end_date}):\n{bullets}"
         )
     experience_summary = "\n".join(exp_sections)
-    
+
     prompt = f"""
     You are an objective technical recruiter assessing fit between a candidate and a job opening.
     
@@ -133,8 +276,11 @@ def analyze_job(job_text: str, master_cv: MasterCV, api_key: str, model: str = "
 
     response_dict = _call_llm_json(
         messages=[
-            {"role": "system", "content": f"You are a strict evaluation engine. Output JSON matching schema: {json.dumps(schema)}"},
-            {"role": "user", "content": prompt}
+            {
+                "role": "system",
+                "content": f"You are a strict evaluation engine. Output JSON matching schema: {json.dumps(schema)}",
+            },
+            {"role": "user", "content": prompt},
         ],
         schema=schema,
         api_key=api_key,
@@ -145,8 +291,28 @@ def analyze_job(job_text: str, master_cv: MasterCV, api_key: str, model: str = "
 
 def verify_skill_claims(claimed_skills: list[str], master_cv: MasterCV) -> list[str]:
     """FR-10a: Deterministic set check. Returns any unapproved skills."""
-    valid_names = {s.en.lower() for s in master_cv.skills} | {s.fr.lower() for s in master_cv.skills}
+    valid_names = {s.en.lower() for s in master_cv.skills} | {
+        s.fr.lower() for s in master_cv.skills
+    }
     return [s for s in claimed_skills if s.lower() not in valid_names]
+
+
+def _extract_claimed_skills(text: str) -> list[str]:
+    """Detects technical-skill mentions in prose using COMMON_TECH_SKILLS.
+
+    Matching is case-insensitive and word-boundary aware, so 'Go' won't match
+    inside 'Google' and 'R' won't match inside 'Redis'. Returns the canonical
+    vocabulary spellings of every term found.
+    """
+    if not text:
+        return []
+    claimed: list[str] = []
+    for skill in COMMON_TECH_SKILLS:
+        # \b anchors; re.escape guards special chars like 'C++', 'C#', '.NET'.
+        pattern = r"(?<![A-Za-z0-9])" + re.escape(skill) + r"(?![A-Za-z0-9])"
+        if re.search(pattern, text, flags=re.IGNORECASE):
+            claimed.append(skill)
+    return claimed
 
 
 def verify_citation_ids(cited_ids: list[str], master_cv: MasterCV) -> list[str]:
@@ -164,7 +330,7 @@ def verify_citation_ids(cited_ids: list[str], master_cv: MasterCV) -> list[str]:
     return [cid for cid in cited_ids if cid not in all_valid_ids]
 
 
-_NUMERAL_RE = re.compile(r'\d+(?:,\d+)*(?:\.\d+)?')
+_NUMERAL_RE = re.compile(r"\d+(?:,\d+)*(?:\.\d+)?")
 
 
 def _extract_numerals(text: str) -> set[str]:
@@ -205,7 +371,9 @@ def verify_numerals(text: str, master_cv: MasterCV) -> list[str]:
             valid_numbers.update(_extract_numerals(b.fr))
 
     # Normalize the candidate tokens too, so formatting differences don't cause false flags
-    return [num for num in found_numbers if not (_extract_numerals(num) & valid_numbers)]
+    return [
+        num for num in found_numbers if not (_extract_numerals(num) & valid_numbers)
+    ]
 
 
 def select_cv_content(
@@ -213,7 +381,7 @@ def select_cv_content(
     master_cv: MasterCV,
     api_key: str,
     language: Literal["en", "fr"] = "en",
-    model: str = "openai/gpt-oss-120b"
+    model: str = "openai/gpt-oss-120b",
 ) -> CVSelection:
     """
     Selects and ranks existing CV items by ID to match the target job posting (FR-8).
@@ -222,13 +390,17 @@ def select_cv_content(
     schema = CVSelection.model_json_schema()
 
     catalog = {
-        "skills": [{"id": s.id, "name": getattr(s, language)} for s in master_cv.skills],
+        "skills": [
+            {"id": s.id, "name": getattr(s, language)} for s in master_cv.skills
+        ],
         "experience": [
             {
                 "id": exp.id,
                 "role": getattr(exp.role, language),
                 "company": exp.company,
-                "bullets": [{"id": b.id, "text": getattr(b, language)} for b in exp.bullets]
+                "bullets": [
+                    {"id": b.id, "text": getattr(b, language)} for b in exp.bullets
+                ],
             }
             for exp in master_cv.experience
         ],
@@ -237,7 +409,9 @@ def select_cv_content(
                 "id": proj.id,
                 "name": proj.name,
                 "description": getattr(proj.description, language),
-                "bullets": [{"id": b.id, "text": getattr(b, language)} for b in proj.bullets]
+                "bullets": [
+                    {"id": b.id, "text": getattr(b, language)} for b in proj.bullets
+                ],
             }
             for proj in master_cv.projects
         ],
@@ -245,10 +419,10 @@ def select_cv_content(
             {
                 "id": edu.id,
                 "degree": getattr(edu.degree, language),
-                "institution": edu.institution
+                "institution": edu.institution,
             }
             for edu in master_cv.education
-        ]
+        ],
     }
 
     prompt = f"""
@@ -273,8 +447,11 @@ def select_cv_content(
 
     data = _call_llm_json(
         messages=[
-            {"role": "system", "content": f"You are a strict data selector. Output JSON matching schema: {json.dumps(schema)}"},
-            {"role": "user", "content": prompt}
+            {
+                "role": "system",
+                "content": f"You are a strict data selector. Output JSON matching schema: {json.dumps(schema)}",
+            },
+            {"role": "user", "content": prompt},
         ],
         schema=schema,
         api_key=api_key,
@@ -283,8 +460,12 @@ def select_cv_content(
     raw_selection = CVSelection(**data)
 
     valid_skill_ids = {s.id for s in master_cv.skills}
-    valid_exp_ids = {exp.id: {b.id for b in exp.bullets} for exp in master_cv.experience}
-    valid_proj_ids = {proj.id: {b.id for b in proj.bullets} for proj in master_cv.projects}
+    valid_exp_ids = {
+        exp.id: {b.id for b in exp.bullets} for exp in master_cv.experience
+    }
+    valid_proj_ids = {
+        proj.id: {b.id for b in proj.bullets} for proj in master_cv.projects
+    }
     valid_edu_ids = {edu.id for edu in master_cv.education}
 
     cleaned_skills = [sid for sid in raw_selection.skill_ids if sid in valid_skill_ids]
@@ -295,7 +476,9 @@ def select_cv_content(
             allowed_bullets = valid_exp_ids[exp.experience_id]
             valid_bullets = [bid for bid in exp.bullet_ids if bid in allowed_bullets]
             cleaned_experiences.append(
-                SelectedExperience(experience_id=exp.experience_id, bullet_ids=valid_bullets)
+                SelectedExperience(
+                    experience_id=exp.experience_id, bullet_ids=valid_bullets
+                )
             )
 
     cleaned_projects = []
@@ -307,14 +490,20 @@ def select_cv_content(
                 SelectedProject(project_id=proj.project_id, bullet_ids=valid_bullets)
             )
 
-    cleaned_education = [eid for eid in raw_selection.education_ids if eid in valid_edu_ids]
+    cleaned_education = [
+        eid for eid in raw_selection.education_ids if eid in valid_edu_ids
+    ]
 
     # Safety net: never ship a CV with zero experience. If the LLM selection was
     # emptied by validation, fall back to every experience (with all its bullets).
     if not cleaned_experiences and master_cv.experience:
-        print("[!] No experiences survived validation; falling back to all experiences.")
+        print(
+            "[!] No experiences survived validation; falling back to all experiences."
+        )
         cleaned_experiences = [
-            SelectedExperience(experience_id=exp.id, bullet_ids=[b.id for b in exp.bullets])
+            SelectedExperience(
+                experience_id=exp.id, bullet_ids=[b.id for b in exp.bullets]
+            )
             for exp in master_cv.experience
         ]
 
@@ -324,12 +513,12 @@ def select_cv_content(
         skill_ids=cleaned_skills,
         experiences=cleaned_experiences,
         projects=cleaned_projects,
-        education_ids=cleaned_education
+        education_ids=cleaned_education,
     )
 
 
 def verify_cover_letter(letter: CoverLetterDraft, master_cv: MasterCV) -> list[str]:
-    """Runs deterministic verification on citations and numerals across all sentences."""
+    """Runs deterministic verification on citations, numerals, and skill claims."""
     errors = []
 
     # 1. Check citation IDs
@@ -342,7 +531,18 @@ def verify_cover_letter(letter: CoverLetterDraft, master_cv: MasterCV) -> list[s
     full_text = " ".join(s.text for s in letter.sentences)
     invalid_numerals = verify_numerals(full_text, master_cv)
     if invalid_numerals:
-        errors.append(f"Fabricated numerals outside facts/allowlist: {', '.join(invalid_numerals)}")
+        errors.append(
+            f"Fabricated numerals outside facts/allowlist: {', '.join(invalid_numerals)}"
+        )
+
+    # 3. Check skill claims (FR-10a): any technical skill named in the letter that
+    #    is not present in the Master CV is treated as a fabricated claim.
+    claimed_skills = _extract_claimed_skills(full_text)
+    unapproved_skills = verify_skill_claims(claimed_skills, master_cv)
+    if unapproved_skills:
+        errors.append(
+            f"Skills claimed but not present in Master CV: {', '.join(unapproved_skills)}"
+        )
 
     return errors
 
@@ -353,7 +553,7 @@ def generate_cover_letter(
     api_key: str,
     language: Literal["en", "fr"] = "en",
     model: str = "openai/gpt-oss-120b",
-    max_retries: int = 2
+    max_retries: int = 2,
 ) -> CoverLetter:
     """
     FR-9 & FR-10: Generates a tailored 3-4 paragraph cover letter where every factual claim
@@ -364,13 +564,17 @@ def generate_cover_letter(
     catalog = {
         "candidate_name": master_cv.personal_info.name,
         "facts": master_cv.facts.model_dump(),
-        "skills": [{"id": s.id, "name": getattr(s, language)} for s in master_cv.skills],
+        "skills": [
+            {"id": s.id, "name": getattr(s, language)} for s in master_cv.skills
+        ],
         "experience": [
             {
                 "id": exp.id,
                 "role": getattr(exp.role, language),
                 "company": exp.company,
-                "bullets": [{"id": b.id, "text": getattr(b, language)} for b in exp.bullets]
+                "bullets": [
+                    {"id": b.id, "text": getattr(b, language)} for b in exp.bullets
+                ],
             }
             for exp in master_cv.experience
         ],
@@ -378,10 +582,12 @@ def generate_cover_letter(
             {
                 "id": proj.id,
                 "name": proj.name,
-                "bullets": [{"id": b.id, "text": getattr(b, language)} for b in proj.bullets]
+                "bullets": [
+                    {"id": b.id, "text": getattr(b, language)} for b in proj.bullets
+                ],
             }
             for proj in master_cv.projects
-        ]
+        ],
     }
 
     base_prompt = f"""
@@ -405,8 +611,11 @@ CRITICAL HONESTY & FORMAT RULES:
 """
 
     messages = [
-        {"role": "system", "content": f"You are a strict technical writer with zero-hallucination constraints. Output JSON matching schema: {json.dumps(schema)}"},
-        {"role": "user", "content": base_prompt}
+        {
+            "role": "system",
+            "content": f"You are a strict technical writer with zero-hallucination constraints. Output JSON matching schema: {json.dumps(schema)}",
+        },
+        {"role": "user", "content": base_prompt},
     ]
 
     for attempt in range(max_retries + 1):
@@ -425,7 +634,9 @@ CRITICAL HONESTY & FORMAT RULES:
         errors = verify_cover_letter(draft, master_cv)
 
         if not errors:
-            return CoverLetter(**draft.model_dump(), verification_passed=True, verification_warnings=[])
+            return CoverLetter(
+                **draft.model_dump(), verification_passed=True, verification_warnings=[]
+            )
 
         print(f"[!] Verification failed on attempt {attempt + 1}: {errors}")
 
@@ -440,7 +651,9 @@ Ensure every cited ID strictly matches an ID from the candidate catalog, and rem
             messages.append({"role": "assistant", "content": raw_content})
             messages.append({"role": "user", "content": correction_instruction})
 
-    return CoverLetter(**draft.model_dump(), verification_passed=False, verification_warnings=errors)
+    return CoverLetter(
+        **draft.model_dump(), verification_passed=False, verification_warnings=errors
+    )
 
 
 def extract_text_from_pdf(pdf_source: bytes | str) -> str:
@@ -449,16 +662,14 @@ def extract_text_from_pdf(pdf_source: bytes | str) -> str:
         doc = pymupdf.open(stream=pdf_source, filetype="pdf")
     else:
         doc = pymupdf.open(pdf_source)
-    
+
     extracted_text = "\n".join(page.get_text() for page in doc)
     doc.close()
     return extracted_text.strip()
 
 
 def parse_pdf_to_master_cv(
-    pdf_text: str, 
-    api_key: str,
-    model: str = "openai/gpt-oss-120b"
+    pdf_text: str, api_key: str, model: str = "openai/gpt-oss-120b"
 ) -> MasterCV:
     """
     Parses unstructured CV text into a verified MasterCV object.
@@ -473,7 +684,7 @@ RESUME TEXT:
 \"\"\"{pdf_text}\"\"\"
 
 EXTRACTION REQUIREMENTS:
-1. PERSONAL INFO: Name, email, phone, location, linkedin, github.
+1. PERSONAL INFO: Name, email, phone, location, linkedin, github. Capture 'phone' and 'location' (city, country) whenever they appear in the resume; omit them only if truly absent.
 2. SKILLS: Every single technical tool, language, or framework with id 'sk_<name>'.
 3. EXPERIENCE: You MUST extract all work experience entries. For each role, provide 1-3 achievement bullets with realistic French ('fr') translations alongside English ('en').
 4. PROJECTS: If the candidate lists academic or personal projects, extract them under 'projects'.
@@ -483,8 +694,11 @@ EXTRACTION REQUIREMENTS:
 
     data = _call_llm_json(
         messages=[
-            {"role": "system", "content": f"You are a strict data transformation engine. Output JSON matching schema: {json.dumps(schema)}"},
-            {"role": "user", "content": prompt}
+            {
+                "role": "system",
+                "content": f"You are a strict data transformation engine. Output JSON matching schema: {json.dumps(schema)}",
+            },
+            {"role": "user", "content": prompt},
         ],
         schema=schema,
         api_key=api_key,

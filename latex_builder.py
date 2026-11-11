@@ -37,7 +37,9 @@ def find_pdflatex_binary() -> str:
         return binary
 
     local_app_data = os.environ.get("LOCALAPPDATA", "")
-    user_miktex = os.path.join(local_app_data, "Programs", "MiKTeX", "miktex", "bin", "x64", "pdflatex.exe")
+    user_miktex = os.path.join(
+        local_app_data, "Programs", "MiKTeX", "miktex", "bin", "x64", "pdflatex.exe"
+    )
     if os.path.exists(user_miktex):
         return user_miktex
 
@@ -45,7 +47,9 @@ def find_pdflatex_binary() -> str:
     if os.path.exists(system_miktex):
         return system_miktex
 
-    raise EnvironmentError("pdflatex executable was not found. Please ensure MiKTeX or TeX Live is installed.")
+    raise EnvironmentError(
+        "pdflatex executable was not found. Please ensure MiKTeX or TeX Live is installed."
+    )
 
 
 def render_cv_latex(selection: CVSelection, master_cv: MasterCV) -> str:
@@ -54,6 +58,25 @@ def render_cv_latex(selection: CVSelection, master_cv: MasterCV) -> str:
     p_info = master_cv.personal_info
 
     # 1. Header / Preamble (mirrors reference main.tex styling)
+    # Build the contact line dynamically so phone/location appear only when present.
+    contact_parts = []
+    if p_info.phone:
+        contact_parts.append(escape_latex(p_info.phone))
+    if p_info.location:
+        contact_parts.append(escape_latex(p_info.location))
+    contact_parts.append(
+        rf"\href{{mailto:{escape_latex(p_info.email)}}}{{{escape_latex(p_info.email)}}}"
+    )
+    if p_info.linkedin:
+        contact_parts.append(
+            rf"\href{{https://{escape_latex(p_info.linkedin)}}}{{{escape_latex(p_info.linkedin)}}}"
+        )
+    if p_info.github:
+        contact_parts.append(
+            rf"\href{{https://{escape_latex(p_info.github)}}}{{{escape_latex(p_info.github)}}}"
+        )
+    contact_line = r" \ \ $|$ \ \ ".join(contact_parts)
+
     header = rf"""\documentclass[10pt,a4paper]{{article}}
 \usepackage[margin=0.6in]{{geometry}}
 \usepackage[T1]{{fontenc}}
@@ -76,15 +99,17 @@ def render_cv_latex(selection: CVSelection, master_cv: MasterCV) -> str:
 \begin{{center}}
 {{\LARGE \textbf{{{escape_latex(p_info.name)}}}}}\\[3pt]
 {{\large {escape_latex(selection.target_role)}}}\\[3pt]
-\href{{mailto:{escape_latex(p_info.email)}}}{{{escape_latex(p_info.email)}}} \ \ $|$ \ \ 
-\href{{https://{escape_latex(p_info.linkedin)}}}{{{escape_latex(p_info.linkedin)}}} \ \ $|$ \ \ 
-\href{{https://{escape_latex(p_info.github)}}}{{{escape_latex(p_info.github)}}}
+{contact_line}
 \end{{center}}
 """
 
     # 2. Selected Skills (flat, comma-separated flowing line)
     skills_map = {s.id: getattr(s, lang) for s in master_cv.skills}
-    chosen_skills = [escape_latex(skills_map[sid]) for sid in selection.skill_ids if sid in skills_map]
+    chosen_skills = [
+        escape_latex(skills_map[sid])
+        for sid in selection.skill_ids
+        if sid in skills_map
+    ]
 
     skills_title = "Compétences Techniques" if lang == "fr" else "Technical Skills"
     skills_body = ", ".join(chosen_skills)
@@ -145,18 +170,25 @@ def render_cv_latex(selection: CVSelection, master_cv: MasterCV) -> str:
 
             # Linked project name if a URL exists, otherwise plain bold name.
             if proj.url:
-                name_latex = rf"\href{{{proj.url}}}{{\textbf{{{escape_latex(proj.name)}}}}}"
+                name_latex = (
+                    rf"\href{{{proj.url}}}{{\textbf{{{escape_latex(proj.name)}}}}}"
+                )
             else:
                 name_latex = rf"\textbf{{{escape_latex(proj.name)}}}"
 
             bullet_lookup = {b.id: getattr(b, lang) for b in proj.bullets}
             bullet_items = [
                 rf"  \item {escape_latex(bullet_lookup[bid])}"
-                for bid in sel_proj.bullet_ids if bid in bullet_lookup
+                for bid in sel_proj.bullet_ids
+                if bid in bullet_lookup
             ]
             bullets_latex = ""
             if bullet_items:
-                bullets_latex = "\n\\begin{itemize}\n" + "\n".join(bullet_items) + "\n\\end{itemize}"
+                bullets_latex = (
+                    "\n\\begin{itemize}\n"
+                    + "\n".join(bullet_items)
+                    + "\n\\end{itemize}"
+                )
 
             sep = "\n\\vspace{3pt}" if idx > 0 else ""
             p_block = rf"""{sep}
@@ -194,10 +226,19 @@ def render_cv_latex(selection: CVSelection, master_cv: MasterCV) -> str:
 """
 
     footer = "\n\\end{document}\n"
-    return header + experience_section + proj_section + education_section + skills_section + footer
+    return (
+        header
+        + experience_section
+        + proj_section
+        + education_section
+        + skills_section
+        + footer
+    )
 
 
-def compile_latex(tex_code: str, output_dir: str = "output", job_name: str = "cv") -> tuple[str, int]:
+def compile_latex(
+    tex_code: str, output_dir: str = "output", job_name: str = "cv"
+) -> tuple[str, int]:
     """Compiles LaTeX code to PDF using pdflatex. Returns (pdf_path, page_count)."""
     pdflatex_bin = find_pdflatex_binary()
 
@@ -212,12 +253,14 @@ def compile_latex(tex_code: str, output_dir: str = "output", job_name: str = "cv
         pdflatex_bin,
         "-interaction=nonstopmode",
         f"-output-directory={output_dir}",
-        tex_path
+        tex_path,
     ]
     subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
 
     if not os.path.exists(pdf_path):
-        raise RuntimeError(f"LaTeX compilation failed. Check {os.path.join(output_dir, f'{job_name}.log')}")
+        raise RuntimeError(
+            f"LaTeX compilation failed. Check {os.path.join(output_dir, f'{job_name}.log')}"
+        )
 
     doc = pymupdf.open(pdf_path)
     page_count = doc.page_count
@@ -227,10 +270,10 @@ def compile_latex(tex_code: str, output_dir: str = "output", job_name: str = "cv
 
 
 def compile_to_single_page(
-    selection: CVSelection, 
-    master_cv: MasterCV, 
+    selection: CVSelection,
+    master_cv: MasterCV,
     output_dir: str = "output",
-    job_name: str = "tailored_cv"
+    job_name: str = "tailored_cv",
 ) -> str:
     """FR-13: Compiles CV and drops lowest-ranked items until it fits on exactly 1 page."""
     current_selection = selection.model_copy(deep=True)
@@ -238,19 +281,27 @@ def compile_to_single_page(
 
     for iteration in range(max_prune_iterations):
         tex_code = render_cv_latex(current_selection, master_cv)
-        pdf_path, pages = compile_latex(tex_code, output_dir=output_dir, job_name=job_name)
+        pdf_path, pages = compile_latex(
+            tex_code, output_dir=output_dir, job_name=job_name
+        )
 
         if pages == 1:
             print(f"[✓] Successfully compiled 1-page CV: {pdf_path}")
             return pdf_path
 
-        print(f"[!] Document overflowed ({pages} pages). Pruning lowest-priority content (Pass {iteration + 1})...")
+        print(
+            f"[!] Document overflowed ({pages} pages). Pruning lowest-priority content (Pass {iteration + 1})..."
+        )
 
         pruned = False
-        longest_exp = max(current_selection.experiences, key=lambda e: len(e.bullet_ids), default=None)
+        longest_exp = max(
+            current_selection.experiences, key=lambda e: len(e.bullet_ids), default=None
+        )
         if longest_exp and len(longest_exp.bullet_ids) > 1:
             dropped_bullet = longest_exp.bullet_ids.pop()
-            print(f"    - Pruned bullet '{dropped_bullet}' from experience '{longest_exp.experience_id}'")
+            print(
+                f"    - Pruned bullet '{dropped_bullet}' from experience '{longest_exp.experience_id}'"
+            )
             pruned = True
         elif current_selection.projects:
             dropped_proj = current_selection.projects.pop()
@@ -273,6 +324,25 @@ def render_letter_latex(letter: CoverLetter, master_cv: MasterCV) -> str:
     p_info = master_cv.personal_info
     current_date = datetime.date.today().strftime("%B %d, %Y")
 
+    # Build the sender contact line dynamically (phone/location only when present).
+    sender_parts = []
+    if p_info.phone:
+        sender_parts.append(escape_latex(p_info.phone))
+    if p_info.location:
+        sender_parts.append(escape_latex(p_info.location))
+    sender_parts.append(
+        rf"\href{{mailto:{p_info.email}}}{{{escape_latex(p_info.email)}}}"
+    )
+    if p_info.linkedin:
+        sender_parts.append(
+            rf"\href{{https://{p_info.linkedin}}}{{{escape_latex(p_info.linkedin)}}}"
+        )
+    if p_info.github:
+        sender_parts.append(
+            rf"\href{{https://{p_info.github}}}{{{escape_latex(p_info.github)}}}"
+        )
+    sender_line = " $|$ ".join(sender_parts)
+
     header = rf"""\documentclass[11pt,a4paper]{{article}}
 \usepackage[utf8]{{inputenc}}
 \usepackage[margin=1.0in]{{geometry}}
@@ -291,9 +361,7 @@ def render_letter_latex(letter: CoverLetter, master_cv: MasterCV) -> str:
 
 \begin{{flushleft}}
     {{\LARGE \textbf{{{escape_latex(p_info.name)}}}}} \\[4pt]
-    \href{{mailto:{p_info.email}}}{{{escape_latex(p_info.email)}}} $|$ 
-    \href{{https://{p_info.linkedin}}}{{{escape_latex(p_info.linkedin)}}} $|$ 
-    \href{{https://{p_info.github}}}{{{escape_latex(p_info.github)}}}
+    {sender_line}
 \end{{flushleft}}
 
 \vspace{{6pt}}
@@ -341,10 +409,10 @@ def render_letter_latex(letter: CoverLetter, master_cv: MasterCV) -> str:
 
 
 def compile_letter_pdf(
-    letter: CoverLetter, 
-    master_cv: MasterCV, 
-    output_dir: str = "output", 
-    job_name: str = "cover_letter"
+    letter: CoverLetter,
+    master_cv: MasterCV,
+    output_dir: str = "output",
+    job_name: str = "cover_letter",
 ) -> str:
     """Compiles the cover letter into a standalone PDF."""
     tex_code = render_letter_latex(letter, master_cv)
