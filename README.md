@@ -1,5 +1,7 @@
 # CV Tailor
 
+[![Tests](https://github.com/hamza-bou21/cv-tailor/actions/workflows/tests.yml/badge.svg)](https://github.com/hamza-bou21/cv-tailor/actions/workflows/tests.yml)
+
 > An open-source CV tailoring tool that can't fabricate experience: every claim in the output traces back to your real CV, with deterministic checks for fabricated numbers.
 
 ---
