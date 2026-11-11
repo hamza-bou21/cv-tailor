@@ -1,0 +1,67 @@
+personal_info:
+  name: "Alex Taylor"
+  email: "alex.taylor@example.com"
+  linkedin: "linkedin.com/in/alextaylor-demo"
+  github: "github.com/alextaylor-demo"
+  portfolio_url: "alextaylor.dev"
+
+facts:
+  years_experience_total: 6
+  years_experience_backend: 4
+  max_team_size_led: 5
+  highest_traffic_handled_rps: 8000
+  revenue_impact_usd: 500000
+
+skills:
+  - id: "sk_python"
+    en: "Python"
+    fr: "Python"
+  - id: "sk_fastapi"
+    en: "FastAPI"
+    fr: "FastAPI"
+  - id: "sk_sql"
+    en: "PostgreSQL"
+    fr: "PostgreSQL"
+  - id: "sk_docker"
+    en: "Docker"
+    fr: "Docker"
+  - id: "sk_redis"
+    en: "Redis"
+    fr: "Redis"
+
+experience:
+  - id: "exp_techcorp"
+    company: "TechCorp"
+    location: "Remote"
+    role:
+      en: "Backend Engineer"
+      fr: "Ingénieur Backend"
+    start_date: "2021-01"
+    end_date: "Present"
+    bullets:
+      - id: "techcorp_b1"
+        en: "Built high-throughput payment ingestion pipeline handling 8000 requests per second."
+        fr: "Conception d'un pipeline d'ingestion de paiement gérant 8000 requêtes par seconde."
+      - id: "techcorp_b2"
+        en: "Maintained PostgreSQL data stores and reduced query response times by 30% via Redis caching."
+        fr: "Maintenance des bases PostgreSQL et réduction des temps de réponse de 30% via Redis."
+
+projects:
+  - id: "proj_cvtailor"
+    name: "CV Tailor"
+    url: "github.com/alextaylor-demo/cv-tailor"
+    description:
+      en: "Open-source CV tailoring system with strict citation validation."
+      fr: "Système open-source d'adaptation de CV avec validation stricte."
+    bullets:
+      - id: "cvtailor_b1"
+        en: "Engineered deterministic fact-checking logic preventing AI hallucinations in job applications."
+        fr: "Conception d'une logique déterministe empêchant les hallucinations de l'IA."
+
+education:
+  - id: "edu_bsc"
+    institution: "State University"
+    degree:
+      en: "B.S. in Computer Science"
+      fr: "Licence en Informatique"
+    graduation_year: "2018"
