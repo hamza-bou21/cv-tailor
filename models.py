@@ -44,7 +44,7 @@ class Bullet(BaseModel):
 class Experience(BaseModel):
     id: str
     company: str
-    location: str
+    location: Optional[str] = None
     role: BilingualText
     start_date: str
     end_date: str
@@ -64,6 +64,21 @@ class Education(BaseModel):
     institution: str
     degree: BilingualText
     graduation_year: str
+
+
+# ---------------------------------------------------------
+# 1b. PDF extraction helpers
+# ---------------------------------------------------------
+
+
+class PdfLink(BaseModel):
+    """A hyperlink found in a PDF, anchored to the text it visually overlays."""
+
+    anchor_text: str = Field(
+        default="",
+        description="Visible text near/under the link rectangle (e.g. 'Live demo').",
+    )
+    url: str
 
 
 # ---------------------------------------------------------

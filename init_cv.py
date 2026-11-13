@@ -1,49 +1,25 @@
 import os
 import sys
 
-import pymupdf
-
-from core import extract_text_from_pdf, parse_pdf_to_master_cv, save_master_cv
-
-
-def extract_hyperlinks(pdf_path: str) -> list[str]:
-    """Extracts embedded hyperlink URIs from a PDF (unique, order-preserving)."""
-    links: list[str] = []
-    seen: set[str] = set()
-    doc = pymupdf.open(pdf_path)
-    try:
-        for page in doc:
-            for link in page.get_links():
-                uri = link.get("uri")
-                if uri and uri not in seen:
-                    seen.add(uri)
-                    links.append(uri)
-    finally:
-        doc.close()
-    return links
+from core import build_master_cv_from_pdf, save_master_cv
 
 
 def extract_cv_to_yaml(
     pdf_path: str, api_key: str, output_path: str = "master_cv.yaml"
 ) -> None:
-    """Extracts a PDF CV, builds a MasterCV via the shared core pipeline, and saves it as YAML."""
+    """Extracts a PDF CV via the shared core pipeline and saves it as YAML."""
     print(f"Reading {pdf_path}...")
-    raw_text = extract_text_from_pdf(pdf_path)
-    hyperlinks = extract_hyperlinks(pdf_path)
 
-    combined_content = (
-        raw_text if raw_text.strip() else "(no extractable text found in PDF)"
-    )
+    with open(pdf_path, "rb") as f:
+        pdf_bytes = f.read()
 
-    if hyperlinks:
-        link_block = "\n".join(f"- {link}" for link in hyperlinks)
-        combined_content += f"\n\n--- EXTRACTED HYPERLINKS ---\n{link_block}"
+    print("Extracting text, hyperlinks, and calling Groq for structured extraction...")
+    validated_cv, warnings = build_master_cv_from_pdf(pdf_bytes, api_key=api_key)
 
-    if len(raw_text.strip()) < 50:
-        print("Warning: Very little text was extracted. The CV may be a scanned image.")
-
-    print("Sending PDF text and links to Groq for extraction...")
-    validated_cv = parse_pdf_to_master_cv(combined_content, api_key=api_key)
+    if warnings:
+        print("\n[!] Grounding warnings (review the extracted YAML):")
+        for w in warnings:
+            print(f"    - {w}")
 
     print(f"Validation successful! Writing to {output_path}...")
     save_master_cv(validated_cv, output_path)
