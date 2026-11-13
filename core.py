@@ -481,7 +481,7 @@ def select_cv_content(
                 )
             )
 
-    cleaned_projects = []
+        cleaned_projects = []
     for proj in raw_selection.projects:
         if proj.project_id in valid_proj_ids:
             allowed_bullets = valid_proj_ids[proj.project_id]
@@ -490,12 +490,13 @@ def select_cv_content(
                 SelectedProject(project_id=proj.project_id, bullet_ids=valid_bullets)
             )
 
-        cleaned_education = [
-            eid for eid in raw_selection.education_ids if eid in valid_edu_ids
-        ]
+    cleaned_education = [
+        eid for eid in raw_selection.education_ids if eid in valid_edu_ids
+    ]
 
-    # Education is a CORE section: if the LLM returned none (or all were invalid),
-    # fall back to every education entry so it can never be silently dropped.
+    # Education is a CORE section: it must never be empty when the Master CV has
+    # degrees. Only fall back to ALL entries if the LLM returned none at all;
+    # otherwise honour the selected subset (the renderer still shows every entry).
     if not cleaned_education and master_cv.education:
         print(
             "[!] No education entries survived validation; falling back to all education."
@@ -696,8 +697,8 @@ EXTRACTION REQUIREMENTS:
 2. SKILLS: Every single technical tool, language, or framework with id 'sk_<name>'.
 3. EXPERIENCE: You MUST extract all work experience entries. For each role, provide 1-3 achievement bullets with realistic French ('fr') translations alongside English ('en').
 4. PROJECTS: If the candidate lists academic or personal projects, extract them under 'projects'.
-5. EDUCATION: You MUST extract degree, institution name, and graduation year under 'education'.
-6. Do NOT leave 'experience' or 'education' empty if there is any mention of work, study, or degrees in the text.
+5. EDUCATION: You MUST extract EVERY degree and qualification listed (e.g. Bachelor's, Master's, PhD, diplomas, associate degrees). Create ONE education entry per degree — do NOT merge multiple degrees into a single entry and do NOT stop after the first. Each entry needs a unique id 'edu_<slug>', institution name, the full degree title, and graduation year.
+6. Do NOT leave 'experience' or 'education' empty if there is any mention of work, study, or degrees in the text. The number of 'education' entries must match the number of distinct degrees in the resume.
 """
 
     data = _call_llm_json(
