@@ -490,9 +490,17 @@ def select_cv_content(
                 SelectedProject(project_id=proj.project_id, bullet_ids=valid_bullets)
             )
 
-    cleaned_education = [
-        eid for eid in raw_selection.education_ids if eid in valid_edu_ids
-    ]
+        cleaned_education = [
+            eid for eid in raw_selection.education_ids if eid in valid_edu_ids
+        ]
+
+    # Education is a CORE section: if the LLM returned none (or all were invalid),
+    # fall back to every education entry so it can never be silently dropped.
+    if not cleaned_education and master_cv.education:
+        print(
+            "[!] No education entries survived validation; falling back to all education."
+        )
+        cleaned_education = [edu.id for edu in master_cv.education]
 
     # Safety net: never ship a CV with zero experience. If the LLM selection was
     # emptied by validation, fall back to every experience (with all its bullets).

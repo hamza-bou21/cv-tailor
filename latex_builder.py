@@ -201,14 +201,15 @@ def render_cv_latex(selection: CVSelection, master_cv: MasterCV) -> str:
 {"".join(proj_blocks)}
 """
 
-    # 5. Education (inline degree, institution -- dates), respecting selection order
+        # 5. Education — CORE SECTION: always include every education entry, never
+    # drop or subset it. Education is mandatory and must survive any pruning.
     edu_title = "Formation" if lang == "fr" else "Education"
     edu_lookup = {e.id: e for e in master_cv.education}
 
-    # Preserve the ranked order from the selection; fall back to all if none selected.
+    # Render all education entries from the Master CV (not just the LLM-selected
+    # subset), ordered by the selection when possible, then any remaining ones.
     ordered_edu_ids = [eid for eid in selection.education_ids if eid in edu_lookup]
-    if not ordered_edu_ids:
-        ordered_edu_ids = list(edu_lookup.keys())
+    ordered_edu_ids += [eid for eid in edu_lookup if eid not in ordered_edu_ids]
 
     edu_blocks = []
     for eid in ordered_edu_ids:
