@@ -18,6 +18,7 @@ from models import (
     CoverLetterDraft,
     CoverLetterSentence,
     PdfLink,
+    Skill,
 )
 
 load_dotenv()
@@ -250,6 +251,15 @@ def analyze_job(
         )
     experience_summary = "\n".join(exp_sections)
 
+    # 4. Format projects (name, description, and all bullets) so project-level
+    #    technical achievements are evaluated in strengths/gaps/keywords.
+    proj_sections = []
+    for proj in master_cv.projects:
+        bullets = "\n".join(f"    - {b.en}" for b in proj.bullets)
+        proj_sections.append(f"  • {proj.name} — {proj.description.en}:\n{bullets}")
+    projects_summary = "\n".join(proj_sections)
+
+    # 5. Spoken languages and any other skills live in master_cv.skills already.
     prompt = f"""
     You are an objective technical recruiter assessing fit between a candidate and a job opening.
     
@@ -257,11 +267,14 @@ def analyze_job(
     Documented Facts:
 {facts_summary}
 
-    Documented Skills:
+    Documented Skills (including spoken languages with proficiency):
     {', '.join(known_skills)}
 
     Documented Experience & Verified Achievements:
 {experience_summary}
+
+    Documented Projects & Technical Achievements:
+{projects_summary}
     
     JOB DESCRIPTION:
     \"\"\"{job_text}\"\"\"
@@ -272,10 +285,13 @@ def analyze_job(
        - 'apply' if score >= 75
        - 'stretch' if score >= 50 and < 75
        - 'skip' if score < 50
-    3. 'strengths' must only reference verified candidate capabilities.
-    4. 'gaps' must list unmet job requirements.
-    5. 'covered_keywords' must only include keywords the candidate demonstrably has.
-        6. 'missing_keywords' must list keywords present in the job but absent from candidate's profile.
+    3. 'strengths' must only reference verified candidate capabilities. Consider BOTH
+       experience bullets AND project bullets as evidence.
+    4. 'gaps' must list unmet job requirements — only list a gap if NO experience or
+       project bullet demonstrates the capability.
+    5. 'covered_keywords' must only include keywords the candidate demonstrably has
+       (from skills, experience, or projects).
+    6. 'missing_keywords' must list keywords present in the job but absent from candidate's profile.
     """
 
     response_dict = _call_llm_json(
@@ -293,25 +309,127 @@ def analyze_job(
     return FitAnalysis(**response_dict)
 
 
+_SKILL_GROUP_RE = re.compile(r"^(?P<base>[^()]+?)\s*\((?P<inner>[^()]*)\)\s*$")
+
+# Parenthetical values that denote a proficiency/level rather than a grouped
+# sub-skill (e.g. "English (C1)", "Arabic (native)", "French (B2)").
+_PROFICIENCY_TOKENS = {
+    "native",
+    "natif",
+    "native speaker",
+    "fluent",
+    "courant",
+    "bilingual",
+    "bilingue",
+    "professional",
+    "professionnel",
+    "intermediate",
+    "intermédiaire",
+    "basic",
+    "débutant",
+    "beginner",
+    "advanced",
+    "avancé",
+    "conversational",
+    "a1",
+    "a2",
+    "b1",
+    "b2",
+    "c1",
+    "c2",
+    "mother tongue",
+    "langue maternelle",
+}
+
+
+def _is_proficiency_parenthetical(inner: str) -> bool:
+    """True if a parenthetical denotes a spoken-language level, not sub-skills."""
+    norm = inner.strip().lower()
+    return norm in _PROFICIENCY_TOKENS
+
+
+def _split_skill_string(name: str) -> list[str]:
+    """Splits a grouped skill label into atomic skill names.
+
+    Examples (only when the parenthetical holds sub-skills, not a proficiency):
+      'Python (Pandas, NumPy, Scikit-learn)' -> ['Python', 'Pandas', 'NumPy', 'Scikit-learn']
+      'Python/Pandas/NumPy'                  -> ['Python', 'Pandas', 'NumPy']
+    Proficiency parentheticals are preserved as-is:
+      'English (C1)' -> ['English (C1)']
+    """
+    if not name:
+        return []
+    match = _SKILL_GROUP_RE.match(name.strip())
+    if match and not _is_proficiency_parenthetical(match.group("inner")):
+        base = match.group("base").strip()
+        inner = match.group("inner")
+        parts = re.split(r"\s*[,/;|]\s*", inner)
+        atoms = [base] + [p.strip() for p in parts if p.strip()]
+        return [a for a in atoms if a]
+
+    # No parenthetical grouping: split any slash/comma-delimited listing.
+    if re.search(r"[,/;|]", name):
+        parts = re.split(r"\s*[,/;|]\s*", name)
+        return [p.strip() for p in parts if p.strip()]
+
+    return [name.strip()]
+
+
+def _skill_slug(name: str) -> str:
+    """Builds a clean skill id slug, e.g. 'Scikit-learn' -> 'sk_scikit_learn'."""
+    slug = re.sub(r"[^a-z0-9]+", "_", name.strip().lower()).strip("_")
+    return f"sk_{slug}" if slug else "sk_skill"
+
+
+def _expand_skill_aliases(name: str) -> set[str]:
+    """Returns the lowercase alias set for one skill label (base + sub-skills).
+
+    'Python (Pandas, NumPy, Scikit-learn)' -> {'python', 'pandas', 'numpy',
+    'scikit-learn'}. Proficiency parentheticals stay intact ('english (c1)').
+    """
+    aliases: set[str] = set()
+    for atom in _split_skill_string(name):
+        aliases.add(atom.lower())
+    aliases.add(name.strip().lower())
+    return aliases
+
+
 def verify_skill_claims(claimed_skills: list[str], master_cv: MasterCV) -> list[str]:
-    """FR-10a: Deterministic set check. Returns any unapproved skills."""
-    valid_names = {s.en.lower() for s in master_cv.skills} | {
-        s.fr.lower() for s in master_cv.skills
-    }
+    """FR-10a: Deterministic set check. Returns any unapproved skills.
+
+    The allowed set expands grouped parentheticals so an older/manual YAML that
+    still stores 'Python (Pandas, NumPy, Scikit-learn)' as one entry validates
+    each atomic skill ('python', 'pandas', 'numpy', 'scikit-learn') correctly.
+    """
+    valid_names: set[str] = set()
+    for s in master_cv.skills:
+        valid_names.update(_expand_skill_aliases(s.en))
+        valid_names.update(_expand_skill_aliases(s.fr))
     return [s for s in claimed_skills if s.lower() not in valid_names]
+
+
+# Strict single-letter skill names (case-sensitive whole-word matching only).
+_SINGLE_LETTER_SKILLS = {"R"}
 
 
 def _extract_claimed_skills(text: str) -> list[str]:
     """Detects technical-skill mentions in prose using COMMON_TECH_SKILLS.
 
-    Matching is case-insensitive and word-boundary aware, so 'Go' won't match
-    inside 'Google' and 'R' won't match inside 'Redis'. Returns the canonical
-    vocabulary spellings of every term found.
+    Most skills use case-insensitive word-boundary matching so 'Go' won't match
+    inside 'Google'. Single-letter skills like 'R' use strict whole-word AND
+    case-sensitive matching (\\bR\\b uppercase only), so French prose and ordinary
+    words never trigger a false positive.
     """
     if not text:
         return []
     claimed: list[str] = []
     for skill in COMMON_TECH_SKILLS:
+        if skill in _SINGLE_LETTER_SKILLS:
+            if re.search(
+                r"(?<![A-Za-z0-9])" + re.escape(skill) + r"(?![A-Za-z0-9])", text
+            ):
+                claimed.append(skill)
+            continue
         # \b anchors; re.escape guards special chars like 'C++', 'C#', '.NET'.
         pattern = r"(?<![A-Za-z0-9])" + re.escape(skill) + r"(?![A-Za-z0-9])"
         if re.search(pattern, text, flags=re.IGNORECASE):
@@ -621,6 +739,7 @@ CRITICAL HONESTY & FORMAT RULES:
 3. If a sentence is an opening greeting, transition, or closing signoff, 'based_on' must be an empty list [].
 4. DO NOT invent metrics or numbers. Only use numbers present in the candidate facts or bullets.
 5. DO NOT reference technologies or skills not listed in the candidate data.
+6. NEVER name a programming language, framework, or library that is absent from the candidate's skills, experience, and projects — even if the job description mentions it. This includes single-letter languages like 'R'. Derive the language from the candidate data only.
 """
 
     messages = [
@@ -945,14 +1064,21 @@ STRICT EXTRACTION RULES (zero fabrication — this is the core guarantee of the 
 4. PERSONAL INFO: name, email, phone, linkedin, github, portfolio_url. Only fill fields that
    are actually present; use null otherwise.
 5. SKILLS: Each distinct technical tool/language/framework once, id 'sk_<slug>'.
-6. EXPERIENCE: EVERY work entry. Translate each bullet faithfully to French ('fr'); the French
+   DECOMPOSE grouped skills into ATOMIC entries: 'Python (Pandas, NumPy, Scikit-learn)'
+   becomes FOUR skills: Python (sk_python), Pandas (sk_pandas), NumPy (sk_numpy),
+   Scikit-learn (sk_scikit_learn). Never keep parenthetical groups as a single skill.
+6. SPOKEN LANGUAGES: Extract spoken languages and proficiency levels stated ANYWHERE in
+   the CV (Skills, Summary, header) as atomic 'skills' entries preserving the level tag,
+   e.g. 'Arabic (native)'/'Arabe (natif)', 'English (C1)'/'Anglais (C1)',
+   'French (B2)'/'Français (B2)'. Do NOT drop languages just because they are in a Summary.
+7. EXPERIENCE: EVERY work entry. Translate each bullet faithfully to French ('fr'); the French
    MUST preserve all numbers/metrics exactly.
-7. PROJECTS: Extract EVERY project present in the document (do not stop early). One entry per
+8. PROJECTS: Extract EVERY project present in the document (do not stop early). One entry per
    project with id 'proj_<slug>'; attach the matching hyperlink as 'url' when available.
-8. EDUCATION: Extract EVERY degree/qualification listed (Bachelor's, Master's, PhD, diplomas).
+9. EDUCATION: Extract EVERY degree/qualification listed (Bachelor's, Master's, PhD, diplomas).
    ONE entry per degree, id 'edu_<slug>', with institution, full degree title, graduation year.
    Right-aligned dates belong to that degree's line — do not drop the education section.
-9. If 'experience' or 'education' is mentioned anywhere, it MUST NOT be empty.
+10. If 'experience' or 'education' is mentioned anywhere, it MUST NOT be empty.
 """
 
     data = _call_llm_json(
@@ -973,16 +1099,64 @@ STRICT EXTRACTION RULES (zero fabrication — this is the core guarantee of the 
     return cv, warnings
 
 
+def _normalize_extracted_skills(cv: MasterCV) -> MasterCV:
+    """Deterministically splits any grouped skills into atomic Skill entries.
+
+    Handles the case where the LLM still returns a grouped string like
+    'Python (Pandas, NumPy, Scikit-learn)' (or a slash/comma list). Atomic skills
+    get clean ids ('sk_python', 'sk_pandas', ...) and deduplicated EN/FR labels.
+    Proficiency parentheticals (e.g. 'English (C1)', 'Arabic (native)') are
+    preserved verbatim. Returns a new MasterCV; the input is not mutated.
+    """
+    seen_en: set[str] = set()
+    seen_ids: set[str] = set()
+    new_skills: list[Skill] = []
+
+    for skill in cv.skills:
+        en_atoms = _split_skill_string(skill.en)
+        fr_atoms = _split_skill_string(skill.fr)
+
+        # Pair up EN/FR atoms positionally; fall back to the raw label when the
+        # counts don't line up so we never lose information.
+        if len(en_atoms) == len(fr_atoms):
+            pairs = list(zip(en_atoms, fr_atoms))
+        else:
+            pairs = [(a, a) for a in en_atoms] or [(skill.en, skill.fr)]
+
+        for en_name, fr_name in pairs:
+            key = en_name.strip().lower()
+            if not key or key in seen_en:
+                continue
+            seen_en.add(key)
+
+            new_id = _skill_slug(en_name)
+            if new_id in seen_ids:
+                suffix = 2
+                while f"{new_id}_{suffix}" in seen_ids:
+                    suffix += 1
+                new_id = f"{new_id}_{suffix}"
+            seen_ids.add(new_id)
+
+            new_skills.append(Skill(id=new_id, en=en_name.strip(), fr=fr_name.strip()))
+
+    return cv.model_copy(update={"skills": new_skills})
+
+
 def build_master_cv_from_pdf(
     pdf_source: bytes | str, api_key: str, model: str = "openai/gpt-oss-120b"
 ) -> tuple[MasterCV, list[str]]:
     """Shared PDF -> MasterCV pipeline used by both the CLI and the Streamlit UI.
 
     Extracts reading-ordered text plus anchored hyperlinks, runs LLM extraction,
-    and returns ``(master_cv, warnings)`` where warnings are grounding issues.
+    deterministically splits any grouped skills into atomic entries, and returns
+    ``(master_cv, warnings)`` where warnings are grounding issues.
     """
     text, links = extract_pdf_content(pdf_source)
-    return parse_pdf_to_master_cv(text, api_key=api_key, model=model, hyperlinks=links)
+    cv, warnings = parse_pdf_to_master_cv(
+        text, api_key=api_key, model=model, hyperlinks=links
+    )
+    cv = _normalize_extracted_skills(cv)
+    return cv, warnings
 
 
 def save_master_cv(cv: MasterCV, target_path: str):

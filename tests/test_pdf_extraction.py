@@ -22,6 +22,9 @@ from core import (
     extract_pdf_content,
     ground_extraction,
     _dehyphenate,
+    _normalize_extracted_skills,
+    _split_skill_string,
+    analyze_job,
 )
 from models import MasterCV
 
@@ -240,3 +243,158 @@ def test_ground_extraction_direct():
     # Source text lacks the project's '8000' metric -> should be flagged.
     warn = ground_extraction(cv, "Backend Engineer TechCorp, MSc Computer Science")
     assert any("8000" in w for w in warn)
+
+
+# ---------------------------------------------------------------------------
+# Issue 1: atomic skill splitting on extraction
+# ---------------------------------------------------------------------------
+
+
+def test_split_skill_string_decomposes_groups():
+    assert _split_skill_string("Python (Pandas, NumPy, Scikit-learn)") == [
+        "Python",
+        "Pandas",
+        "NumPy",
+        "Scikit-learn",
+    ]
+    assert _split_skill_string("Python/Pandas/NumPy") == ["Python", "Pandas", "NumPy"]
+
+
+def test_split_skill_string_preserves_proficiency_languages():
+    # Spoken-language proficiency parentheticals must NOT be split.
+    assert _split_skill_string("English (C1)") == ["English (C1)"]
+    assert _split_skill_string("Arabic (native)") == ["Arabic (native)"]
+    assert _split_skill_string("French (B2)") == ["French (B2)"]
+
+
+def test_extraction_decomposes_grouped_skill(monkeypatch):
+    """A grouped skill returned by the LLM is split into atomic Skill entries."""
+    payload = _mock_llm_payload()
+    payload["skills"] = [
+        {
+            "id": "sk_python",
+            "en": "Python (Pandas, NumPy, Scikit-learn)",
+            "fr": "Python (Pandas, NumPy, Scikit-learn)",
+        }
+    ]
+    monkeypatch.setattr(core, "_call_llm_json", lambda *a, **k: payload)
+
+    cv, _ = build_master_cv_from_pdf(_make_resume_pdf(), api_key="fake")
+    ids = {s.id for s in cv.skills}
+    assert {"sk_python", "sk_pandas", "sk_numpy", "sk_scikit_learn"} <= ids
+    # No skill label should still contain a parenthetical group.
+    assert all("(" not in s.en for s in cv.skills)
+
+
+# ---------------------------------------------------------------------------
+# Issue 3: spoken languages from a summary block become skills
+# ---------------------------------------------------------------------------
+
+
+def test_spoken_languages_extracted_with_proficiency(monkeypatch):
+    payload = _mock_llm_payload()
+    payload["skills"] = [
+        {"id": "sk_arabic", "en": "Arabic (native)", "fr": "Arabe (natif)"},
+        {"id": "sk_english", "en": "English (C1)", "fr": "Anglais (C1)"},
+        {"id": "sk_french", "en": "French (B2)", "fr": "Français (B2)"},
+    ]
+    monkeypatch.setattr(core, "_call_llm_json", lambda *a, **k: payload)
+
+    cv, _ = build_master_cv_from_pdf(_make_resume_pdf(), api_key="fake")
+    labels = {s.en for s in cv.skills}
+    # Proficiency tags survive the normalization pass intact.
+    assert "Arabic (native)" in labels
+    assert "English (C1)" in labels
+    assert "French (B2)" in labels
+
+
+# ---------------------------------------------------------------------------
+# Issue 1 (model level): normalization is idempotent and dedupes
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_is_safe_for_already_atomic_skills():
+    cv = MasterCV(**_mock_llm_payload())
+    normalized = _normalize_extracted_skills(cv)
+    # Already-atomic 'PyMuPDF' stays a single skill.
+    assert [s.en for s in normalized.skills] == ["PyMuPDF"]
+    # Re-running normalization does not change the result.
+    again = _normalize_extracted_skills(normalized)
+    assert [s.id for s in again.skills] == [s.id for s in normalized.skills]
+
+
+# ---------------------------------------------------------------------------
+# Issue 2: fit analysis includes projects in the LLM payload
+# ---------------------------------------------------------------------------
+
+
+def test_analyze_job_includes_projects_in_prompt(monkeypatch):
+    # A CV whose gap-triggering capability lives ONLY in a project bullet.
+    cv = MasterCV(
+        personal_info={
+            "name": "Data Analyst",
+            "email": "da@example.com",
+            "linkedin": "linkedin.com/in/da",
+            "github": "github.com/da",
+        },
+        facts={"years_experience_total": 3},
+        skills=[{"id": "sk_python", "en": "Python", "fr": "Python"}],
+        experience=[
+            {
+                "id": "exp_1",
+                "company": "Acme",
+                "location": None,
+                "role": {"en": "Data Analyst", "fr": "Analyste"},
+                "start_date": "2022-01",
+                "end_date": "Present",
+                "bullets": [
+                    {
+                        "id": "b1",
+                        "en": "Built dashboards",
+                        "fr": "Créé des tableaux de bord",
+                    }
+                ],
+            }
+        ],
+        projects=[
+            {
+                "id": "proj_ml",
+                "name": "Churn Model",
+                "url": None,
+                "description": {
+                    "en": "Predictive modeling project.",
+                    "fr": "Projet de modélisation prédictive.",
+                },
+                "bullets": [
+                    {
+                        "id": "pb1",
+                        "en": "Handled class imbalance with stratified splits and balanced class weights",
+                        "fr": "Géré le déséquilibre de classes avec des splits stratifiés",
+                    }
+                ],
+            }
+        ],
+    )
+
+    captured = {}
+
+    def _fake_call(messages, schema, api_key, model, **kwargs):
+        captured["messages"] = messages
+        return {
+            "fit_score": 80,
+            "verdict": "apply",
+            "strengths": ["handling class imbalance"],
+            "gaps": [],
+            "covered_keywords": ["class imbalance"],
+            "missing_keywords": [],
+        }
+
+    monkeypatch.setattr(core, "_call_llm_json", _fake_call)
+
+    analyze_job("Looking for class imbalance experience", cv, api_key="fake")
+
+    payload_text = " ".join(m["content"] for m in captured["messages"])
+    # Project name, description, and bullet must all reach the LLM.
+    assert "Churn Model" in payload_text
+    assert "Predictive modeling project." in payload_text
+    assert "stratified splits and balanced class weights" in payload_text
