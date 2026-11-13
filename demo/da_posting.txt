@@ -1,0 +1,20 @@
+Role: Data Analyst — Growth & Operations
+Company: Northstar Retail
+Location: Remote
+
+About the Role:
+We are looking for a Data Analyst to own recurring KPI reporting, build self-serve BI dashboards, and partner with product and operations teams on data-driven experiments.
+
+Responsibilities:
+- Build and maintain automated reporting pipelines and executive dashboards in Power BI or Looker Studio.
+- Write complex SQL queries (BigQuery or Snowflake) to aggregate large transactional datasets and optimize query costs.
+- Use Python (Pandas, Scikit-learn) to automate manual reporting workflows and build predictive models for customer and delivery operations.
+- Partner with product managers and UX teams to evaluate onboarding flows and post-launch feature performance.
+- Monitor data pipeline health and enforce validation checks to prevent reporting discrepancies.
+
+Requirements:
+- 1–3 years of experience in data analysis, business analysis, or analytics operations.
+- Strong proficiency in SQL, Python, and modern BI tools (Power BI, Looker Studio, Excel).
+- Experience modeling tabular data (e.g., Random Forest, XGBoost) and handling class imbalance.
+- Familiarity with dbt and Snowflake is a plus.
+- Clear written communication in English; working proficiency in French is an advantage.
