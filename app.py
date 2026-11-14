@@ -253,6 +253,8 @@ with tab_tailor:
                                         master_cv,
                                         api_key=api_key,
                                         language=language,
+                                        selection=selection,
+                                        fit_result=analysis,
                                     )
                                     letter_job_name = f"cover_letter_{run_tag}"
                                     letter_pdf = compile_letter_pdf(

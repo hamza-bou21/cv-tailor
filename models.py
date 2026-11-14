@@ -11,6 +11,12 @@ class BilingualText(BaseModel):
     fr: str
 
 
+# Alias kept for callers that refer to a generic localized text field, e.g. a
+# skill's optional category. Identical shape to BilingualText, so existing YAML
+# and code keep working unchanged.
+LocalizedText = BilingualText
+
+
 class PersonalInfo(BaseModel):
     name: str
     email: str
@@ -33,6 +39,9 @@ class Skill(BaseModel):
     id: str
     en: str
     fr: str
+    # Optional bilingual grouping category (e.g. Languages & Databases). Defaults
+    # to None so older YAML profiles without a category still validate cleanly.
+    category: Optional[LocalizedText] = None
 
 
 class Bullet(BaseModel):
@@ -64,6 +73,18 @@ class Education(BaseModel):
     institution: str
     degree: BilingualText
     graduation_year: str
+
+
+class SummaryVariant(BaseModel):
+    """A grounded professional summary/profile paragraph extracted from the source CV.
+
+    Stored verbatim-derived (with an FR translation) so the renderer never invents
+    positioning text; the selector only *chooses* among these, never writes new ones.
+    """
+
+    id: str
+    en: str
+    fr: str
 
 
 # ---------------------------------------------------------
@@ -126,6 +147,8 @@ class MasterCV(BaseModel):
     experience: List[Experience] = Field(default_factory=list)
     projects: List[Project] = Field(default_factory=list)
     education: List[Education] = Field(default_factory=list)
+    # Optional grounded summary variants. Defaults to empty for backward compat.
+    summaries: List[SummaryVariant] = Field(default_factory=list)
 
 
 class DocumentRecord(BaseModel):
@@ -173,6 +196,10 @@ class CVSelection(BaseModel):
     )
     education_ids: List[str] = Field(
         default_factory=list, description="Selected education IDs."
+    )
+    summary_id: Optional[str] = Field(
+        default=None,
+        description="ID of the chosen grounded summary variant (or None if no summaries exist).",
     )
 
 

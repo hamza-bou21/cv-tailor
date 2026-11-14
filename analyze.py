@@ -162,7 +162,12 @@ def main():
                 f"\nGenerating and verifying tailored cover letter ({args.lang.upper()})..."
             )
             letter = generate_cover_letter(
-                job_text, cv, api_key=api_key, language=args.lang
+                job_text,
+                cv,
+                api_key=api_key,
+                language=args.lang,
+                selection=selection,
+                fit_result=analysis,
             )
 
             if letter.verification_passed:

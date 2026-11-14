@@ -9,6 +9,45 @@ from typing import Optional
 import pymupdf
 from models import MasterCV, CVSelection, CoverLetter
 
+# ---------------------------------------------------------------------------
+# Layout presets for the two-stage one-page overflow loop (Stage 1 compaction).
+# Each preset tightens font size and vertical spacing progressively. The last
+# preset (9.5pt) is a hard readability floor: we never go below it.
+# ---------------------------------------------------------------------------
+LAYOUT_PRESETS = [
+    {
+        "name": "standard",
+        "font_size": "10.5pt",
+        "mag": "1000",  # microtype/geometry tuning not needed; kept simple
+        "section_pt": "6pt",
+        "titlespacing": "2pt",  # {left}... -> before/after spacing
+        "itemsep": "0.5pt",
+        "topsep": "1.5pt",
+    },
+    {
+        "name": "tight",
+        "font_size": "10pt",
+        "mag": "1000",
+        "section_pt": "4pt",
+        "titlespacing": "1pt",
+        "itemsep": "0pt",
+        "topsep": "1pt",
+    },
+    {
+        "name": "compact",
+        "font_size": "9.5pt",
+        "mag": "1000",
+        "section_pt": "3pt",
+        "titlespacing": "0pt",
+        "itemsep": "0pt",
+        "topsep": "0.5pt",
+    },
+]
+
+# Hard readability floor (must match the smallest preset).
+MIN_FONT_PT = 9.5
+
+
 LATEX_ESCAPE_MAP = {
     "&": r"\&",
     "%": r"\%",
@@ -98,8 +137,119 @@ def find_pdflatex_binary() -> str:
     )
 
 
-def render_cv_latex(selection: CVSelection, master_cv: MasterCV) -> str:
-    """Generates a polished, ATS-compliant LaTeX CV styled after the reference template."""
+def _group_skills_by_category(
+    selection: CVSelection, master_cv: MasterCV, lang: str
+) -> tuple[list[tuple[str, list[str]]], list[str]]:
+    """Groups selected skills into ordered (category_label, [skill_labels]) lines.
+
+    Category lines are ordered by which category holds the highest-ranked skill
+    (i.e. by best rank position across the selection.skill_ids list). Skills within
+    a line follow relevance rank. Skills without a category are returned separately
+    so the caller can render them as a single ungrouped fallback line.
+
+    Returns ``(groups, uncategorized_labels)``.
+    """
+    skills_by_id = {s.id: s for s in master_cv.skills}
+    # Deterministic rank index per skill id.
+    rank = {sid: i for i, sid in enumerate(selection.skill_ids)}
+
+    cat_order: list[str] = []
+    buckets: dict[str, list[tuple[int, str]]] = {}
+    uncategorized: list[tuple[int, str]] = []
+
+    for sid in selection.skill_ids:
+        skill = skills_by_id.get(sid)
+        if skill is None:
+            continue
+        label = escape_latex(getattr(skill, lang))
+        if skill.category is not None:
+            cat_label = getattr(skill.category, lang)
+            if cat_label not in buckets:
+                buckets[cat_label] = []
+                cat_order.append(cat_label)
+            buckets[cat_label].append((rank[sid], label))
+        else:
+            uncategorized.append((rank[sid], label))
+
+    # Order categories by their best (minimum) rank -> most relevant category first.
+    cat_order.sort(key=lambda c: min(r for r, _ in buckets[c]))
+
+    groups: list[tuple[str, list[str]]] = []
+    for cat in cat_order:
+        ordered = [label for _, label in sorted(buckets[cat], key=lambda t: t[0])]
+        groups.append((cat, ordered))
+
+    uncategorized_labels = [
+        label for _, label in sorted(uncategorized, key=lambda t: t[0])
+    ]
+    return groups, uncategorized_labels
+
+
+def _render_skills_section(
+    selection: CVSelection, master_cv: MasterCV, lang: str
+) -> str:
+    """Renders the skills section grouped by category, with an ungrouped fallback."""
+    skills_title = "Compétences Techniques" if lang == "fr" else "Technical Skills"
+    groups, uncategorized = _group_skills_by_category(selection, master_cv, lang)
+
+    lines: list[str] = []
+    for cat_label, labels in groups:
+        if not labels:
+            continue
+        lines.append(
+            rf"\noindent\textbf{{{escape_latex(cat_label)}:}} " + ", ".join(labels)
+        )
+
+    # Fallback: any skills without a category rendered as one ungrouped line.
+    if uncategorized:
+        lines.append(r"\noindent " + ", ".join(uncategorized))
+
+    skills_body = " \\\\\n".join(lines)
+    return rf"""
+% ---------- SKILLS ----------
+\section*{{{skills_title}}}
+{skills_body}
+"""
+
+
+def _render_summary_section(
+    selection: CVSelection, master_cv: MasterCV, lang: str
+) -> str:
+    """Renders the selected grounded summary paragraph below the header (if any)."""
+    if not master_cv.summaries:
+        return ""
+    summary_id = selection.summary_id
+    chosen = None
+    for s in master_cv.summaries:
+        if s.id == summary_id:
+            chosen = s
+            break
+    if chosen is None:
+        chosen = master_cv.summaries[0]
+    text = getattr(chosen, lang) or ""
+    if not text.strip():
+        return ""
+    summary_title = "Profil" if lang == "fr" else "Summary"
+    return rf"""
+% ---------- SUMMARY ----------
+\section*{{{summary_title}}}
+\noindent {escape_latex(text.strip())}
+"""
+
+
+def render_cv_latex(
+    selection: CVSelection,
+    master_cv: MasterCV,
+    preset: Optional[dict] = None,
+) -> str:
+    """Generates a polished, ATS-compliant LaTeX CV styled after the reference template.
+
+    ``preset`` selects a layout preset from :data:`LAYOUT_PRESETS` (defaults to the
+    first / standard preset). It controls base font size and vertical spacing so the
+    overflow loop can compact typography before trimming any content.
+    """
+    if preset is None:
+        preset = LAYOUT_PRESETS[0]
     lang = selection.language
     p_info = master_cv.personal_info
 
@@ -123,7 +273,7 @@ def render_cv_latex(selection: CVSelection, master_cv: MasterCV) -> str:
         )
     contact_line = r" \ \ $|$ \ \ ".join(contact_parts)
 
-    header = rf"""\documentclass[10pt,a4paper]{{article}}
+    header = rf"""\documentclass[{preset["font_size"]},a4paper]{{article}}
 \usepackage[margin=0.6in]{{geometry}}
 \usepackage[T1]{{fontenc}}
 \usepackage[hidelinks]{{hyperref}}
@@ -132,10 +282,10 @@ def render_cv_latex(selection: CVSelection, master_cv: MasterCV) -> str:
 
 \pagestyle{{empty}}
 \setlength{{\parindent}}{{0pt}}
-\setlist[itemize]{{leftmargin=1.2em, itemsep=1pt, topsep=2pt, parsep=0pt}}
+\setlist[itemize]{{leftmargin=1.2em, itemsep={preset["itemsep"]}, topsep={preset["topsep"]}, parsep=0pt}}
 
 \titleformat{{\section}}{{\large\bfseries}}{{}}{{0pt}}{{}}[\titlerule]
-\titlespacing*{{\section}}{{0pt}}{{8pt}}{{4pt}}
+\titlespacing*{{\section}}{{0pt}}{{{preset["section_pt"]}}}{{{preset["titlespacing"]}}}
 
 \newcommand{{\role}}[3]{{\textbf{{#1}} \hfill #3 \\ \textit{{#2}}}}
 
@@ -149,21 +299,11 @@ def render_cv_latex(selection: CVSelection, master_cv: MasterCV) -> str:
 \end{{center}}
 """
 
-    # 2. Selected Skills (flat, comma-separated flowing line)
-    skills_map = {s.id: getattr(s, lang) for s in master_cv.skills}
-    chosen_skills = [
-        escape_latex(skills_map[sid])
-        for sid in selection.skill_ids
-        if sid in skills_map
-    ]
+    # Summary block (rendered right below the header when present).
+    summary_section = _render_summary_section(selection, master_cv, lang)
 
-    skills_title = "Compétences Techniques" if lang == "fr" else "Technical Skills"
-    skills_body = ", ".join(chosen_skills)
-    skills_section = rf"""
-% ---------- SKILLS ----------
-\section*{{{skills_title}}}
-{skills_body}
-"""
+    # 2. Selected Skills (grouped by category when categories are present)
+    skills_section = _render_skills_section(selection, master_cv, lang)
 
     # 3. Selected Experience
     exp_title = "Expérience Professionnelle" if lang == "fr" else "Work Experience"
@@ -247,7 +387,7 @@ def render_cv_latex(selection: CVSelection, master_cv: MasterCV) -> str:
 {"".join(proj_blocks)}
 """
 
-        # 5. Education — CORE SECTION: always include every education entry, never
+    # 5. Education — CORE SECTION: always include every education entry, never
     # drop or subset it. Education is mandatory and must survive any pruning.
     edu_title = "Formation" if lang == "fr" else "Education"
     edu_lookup = {e.id: e for e in master_cv.education}
@@ -275,6 +415,7 @@ def render_cv_latex(selection: CVSelection, master_cv: MasterCV) -> str:
     footer = "\n\\end{document}\n"
     return (
         header
+        + summary_section
         + experience_section
         + proj_section
         + education_section
@@ -316,53 +457,124 @@ def compile_latex(
     return pdf_path, page_count
 
 
+def _prune_one_content_item(selection: CVSelection) -> tuple[CVSelection, Optional[str]]:
+    """Drops the single lowest-ranked content item from a deep-copied selection.
+
+    Pruning order (deterministic, lowest relevance first):
+      1. Drop the lowest-ranked bullet from the lowest-ranked project that still
+         has more than 1 bullet (projects are ordered most->least relevant, so the
+         lowest-ranked project is the last one).
+      2. If the lowest-ranked project has only 1 bullet left, drop that whole
+         project (it is the least relevant project).
+      3. Otherwise drop the lowest-ranked bullet from the lowest-ranked/oldest
+         experience, preserving at least 2 bullets per experience when possible.
+
+    Returns ``(new_selection, description_of_pruned_item)``. If nothing can be
+    pruned without violating the per-block minimums, returns the selection
+    unchanged with ``None``.
+    """
+    new_selection = selection.model_copy(deep=True)
+    MIN_BULLETS_PER_EXPERIENCE = 2
+
+    # Stage A: prune from the lowest-ranked project (projects are most->least).
+    if new_selection.projects:
+        last_proj = new_selection.projects[-1]
+        if len(last_proj.bullet_ids) > 1:
+            dropped = last_proj.bullet_ids.pop()
+            return new_selection, f"project bullet '{dropped}' from '{last_proj.project_id}'"
+        # Only 1 bullet left -> drop the whole (least relevant) project.
+        dropped_proj = new_selection.projects.pop()
+        return new_selection, f"project '{dropped_proj.project_id}'"
+
+    # Stage B: prune from the lowest-ranked/oldest experience, keeping >= 2 bullets
+    # whenever that experience has more than 2 to begin with.
+    for sel_exp in reversed(new_selection.experiences):
+        if len(sel_exp.bullet_ids) > MIN_BULLETS_PER_EXPERIENCE:
+            dropped = sel_exp.bullet_ids.pop()
+            return (
+                new_selection,
+                f"experience bullet '{dropped}' from '{sel_exp.experience_id}'",
+            )
+
+    # Last resort: any experience with more than 1 bullet.
+    for sel_exp in reversed(new_selection.experiences):
+        if len(sel_exp.bullet_ids) > 1:
+            dropped = sel_exp.bullet_ids.pop()
+            return (
+                new_selection,
+                f"experience bullet '{dropped}' from '{sel_exp.experience_id}'",
+            )
+
+    return selection, None
+
+
 def compile_to_single_page(
     selection: CVSelection,
     master_cv: MasterCV,
     output_dir: str = "output",
     job_name: str = "tailored_cv",
 ) -> str:
-    """FR-13: Compiles CV and drops lowest-ranked items until it fits on exactly 1 page."""
-    current_selection = selection.model_copy(deep=True)
-    max_prune_iterations = 8
+    """FR-13: Compiles a CV to exactly one page via a two-stage overflow loop.
 
-    for iteration in range(max_prune_iterations):
-        tex_code = render_cv_latex(current_selection, master_cv)
+    Stage 1 (typography/spacing compaction): render ALL ranked items and step
+    through progressively tighter layout presets (10.5pt -> 10pt -> 9.5pt). The
+    9.5pt preset is a hard readability floor; we never go below it.
+
+    Stage 2 (deterministic lowest-rank pruning): only if the 9.5pt preset still
+    overflows, iteratively drop the lowest-ranked bullet/project/experience item
+    until the PDF fits on one page (or nothing more can be pruned safely).
+    """
+    current_selection = selection.model_copy(deep=True)
+
+    # ----- Stage 1: typography & spacing compaction -----
+    for preset in LAYOUT_PRESETS:
+        tex_code = render_cv_latex(current_selection, master_cv, preset=preset)
         pdf_path, pages = compile_latex(
             tex_code, output_dir=output_dir, job_name=job_name
         )
-
         if pages == 1:
-            print(f"[✓] Successfully compiled 1-page CV: {pdf_path}")
-            return pdf_path
-
-        print(
-            f"[!] Document overflowed ({pages} pages). Pruning lowest-priority content (Pass {iteration + 1})..."
-        )
-
-        pruned = False
-        longest_exp = max(
-            current_selection.experiences, key=lambda e: len(e.bullet_ids), default=None
-        )
-        if longest_exp and len(longest_exp.bullet_ids) > 1:
-            dropped_bullet = longest_exp.bullet_ids.pop()
             print(
-                f"    - Pruned bullet '{dropped_bullet}' from experience '{longest_exp.experience_id}'"
+                f"[OK] Fits on 1 page at preset '{preset['name']}' "
+                f"({preset['font_size']}): {pdf_path}"
             )
-            pruned = True
-        elif current_selection.projects:
-            dropped_proj = current_selection.projects.pop()
-            print(f"    - Pruned project '{dropped_proj.project_id}'")
-            pruned = True
-        elif len(current_selection.skill_ids) > 6:
-            dropped_skill = current_selection.skill_ids.pop()
-            print(f"    - Pruned skill '{dropped_skill}'")
-            pruned = True
+            return pdf_path
+        print(
+            f"[!] Overflow at preset '{preset['name']}' ({preset['font_size']}, "
+            f"{pages} pages). Trying a tighter layout..."
+        )
 
-        if not pruned:
-            print("[!] Cannot prune further without compromising core sections.")
+    # ----- Stage 2: deterministic lowest-rank pruning at the 9.5pt floor -----
+    floor_preset = LAYOUT_PRESETS[-1]
+    max_prune_iterations = 12
+    for iteration in range(max_prune_iterations):
+        pruned_selection, description = _prune_one_content_item(current_selection)
+        if description is None:
+            print(
+                "[!] Cannot prune further without compromising core sections; "
+                "returning best-effort 1+-page output."
+            )
+            break
+
+        current_selection = pruned_selection
+        print(
+            f"    - Pruned {description} (Stage 2 pass {iteration + 1})"
+        )
+
+        tex_code = render_cv_latex(current_selection, master_cv, preset=floor_preset)
+        pdf_path, pages = compile_latex(
+            tex_code, output_dir=output_dir, job_name=job_name
+        )
+        if pages == 1:
+            print(
+                f"[OK] Fits on 1 page after pruning at the "
+                f"{floor_preset['font_size']} floor: {pdf_path}"
+            )
             return pdf_path
 
+    # Final render at the floor preset with whatever content remains.
+    tex_code = render_cv_latex(current_selection, master_cv, preset=floor_preset)
+    pdf_path, _ = compile_latex(tex_code, output_dir=output_dir, job_name=job_name)
+    print(f"[!] Best-effort output (may exceed 1 page): {pdf_path}")
     return pdf_path
 
 

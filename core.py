@@ -19,6 +19,7 @@ from models import (
     CoverLetterSentence,
     PdfLink,
     Skill,
+    SummaryVariant,
 )
 
 load_dotenv()
@@ -167,6 +168,40 @@ COMMON_TECH_SKILLS = {
 }
 
 
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """True if an exception looks like a Groq rate/token-limit (429/413) error."""
+    status = getattr(exc, "status_code", None)
+    if status in (413, 429):
+        return True
+    msg = str(exc).lower()
+    return (
+        "rate_limit" in msg
+        or "rate limit" in msg
+        or "error code: 429" in msg
+        or "error code: 413" in msg
+        or "request too large" in msg
+    )
+
+
+def _reasoning_kwargs_for_model(model: str) -> dict:
+    """Returns extra ``chat.completions.create`` kwargs for reasoning models.
+
+    Reasoning models (``gpt-oss``, ``qwen``) spend part of ``max_tokens`` on
+    internal reasoning before emitting JSON. On Groq that can exhaust the budget
+    and raise "max completion tokens reached before generating a valid document".
+    Capping their reasoning effort keeps enough budget for the JSON document.
+
+    Plain models (e.g. ``llama-3.3-70b-versatile``) reject the unknown
+    ``reasoning_effort`` parameter, so return an empty dict for them.
+    """
+    model_lower = (model or "").lower()
+    if "gpt-oss" in model_lower:
+        return {"reasoning_effort": "low"}
+    if "qwen" in model_lower:
+        return {"reasoning_effort": "none"}
+    return {}
+
+
 def _call_llm_json(
     messages: list[dict],
     schema: dict,
@@ -174,18 +209,33 @@ def _call_llm_json(
     model: str,
     temperature: float = 0.0,
     max_attempts: int = 3,
-    max_tokens: int = 8192,
+    max_tokens: int = 2048,
 ) -> dict:
     """Calls Groq with retry/backoff and robust JSON parsing.
 
     A fresh client is initialized per call from the caller-supplied ``api_key`` so
     no key is ever baked into the module or shared across requests.
     Retries on transient API errors and on malformed JSON payloads, raising a
-    clear RuntimeError if all attempts fail. ``max_tokens`` is set high enough to
-    avoid truncating long bilingual (EN/FR) extraction output.
+    clear RuntimeError if all attempts fail.
+
+    ``max_tokens`` is a per-call budget. Groq's free tier enforces an 8,000 TPM
+    single-request ceiling that sums ``prompt_tokens + max_tokens``; callers must
+    right-size it to their prompt (e.g. 2600 for cover letter / selection / fit
+    analysis, 6000 for full CV extraction) so the combined total stays under the
+    limit while still leaving room for the completion. For reasoning models, the
+    reasoning effort is capped (see :func:`_reasoning_kwargs_for_model`) so those
+    internal tokens don't consume the whole budget before JSON is emitted.
     """
     if not api_key or not api_key.strip():
         raise ValueError("A Groq API key is required to call the language model.")
+
+    # Reasoning models (gpt-oss, qwen) spend part of ``max_tokens`` on internal
+    # reasoning before emitting JSON. On Groq that can exhaust the budget and
+    # raise "max completion tokens reached before generating a valid document".
+    # Cap their reasoning with ``reasoning_effort`` so the JSON still fits. Plain
+    # models (e.g. llama-3.3-70b-versatile) reject this arg, so only send it for
+    # known reasoning model families.
+    reasoning_kwargs = _reasoning_kwargs_for_model(model)
 
     client = Groq(api_key=api_key)
     last_error: Exception | None = None
@@ -197,6 +247,7 @@ def _call_llm_json(
                 response_format={"type": "json_object"},
                 temperature=temperature,
                 max_tokens=max_tokens,
+                **reasoning_kwargs,
             )
             content = response.choices[0].message.content
             return json.loads(content)
@@ -206,6 +257,11 @@ def _call_llm_json(
         except Exception as exc:  # network / rate-limit / API errors
             last_error = exc
             print(f"[!] LLM call failed (attempt {attempt}/{max_attempts}): {exc}")
+            # Rate-limit / token-limit (429 or 413): wait for the rolling 60s TPM
+            # window to clear before retrying, otherwise every retry re-trips it.
+            if _is_rate_limit_error(exc) and attempt < max_attempts:
+                print("[!] Rate/token limit hit; sleeping 10s before retrying...")
+                time.sleep(10)
 
         if attempt < max_attempts:
             time.sleep(min(2 ** (attempt - 1), 8))
@@ -305,6 +361,7 @@ def analyze_job(
         schema=schema,
         api_key=api_key,
         model=model,
+        max_tokens=2600,
     )
     return FitAnalysis(**response_dict)
 
@@ -545,7 +602,19 @@ def select_cv_content(
             }
             for edu in master_cv.education
         ],
+        "summaries": [
+            {"id": s.id, "text": getattr(s, language)} for s in master_cv.summaries
+        ],
     }
+
+    has_summaries = bool(master_cv.summaries)
+
+    summary_rule = (
+        "6. summary_id: choose the single MOST relevant summary variant id from 'summaries' "
+        "for this job. Use null only if 'summaries' is empty. NEVER write a new summary."
+        if has_summaries
+        else "6. summary_id: there are no summary variants; return null."
+    )
 
     prompt = f"""
     You are an expert CV tailoring engine. Your task is to select and prioritize the most relevant items 
@@ -561,10 +630,14 @@ def select_cv_content(
 
     SELECTION RULES:
     1. STRICT PROVENANCE: Use ONLY IDs that exist in the candidate catalog. Do NOT fabricate IDs.
-    2. Rank skill_ids strictly from most relevant to least relevant.
-    3. For each experience, select only bullets that demonstrate relevant impact, ranked by relevance.
-    4. Select up to 2-3 most relevant projects.
-        5. target_role must be a concise title adapted to the job description (e.g. 'Senior Backend Engineer').
+    2. RANK, do not filter: Return ALL valid experience IDs in 'experiences' and, for EACH experience,
+       ALL of its bullet IDs (every bullet in the catalog), ordered from MOST relevant to LEAST relevant.
+       Do NOT drop bullets; the downstream layout engine decides what to trim.
+    3. Return ALL valid project IDs in 'projects' and, for EACH project, ALL of its bullet IDs,
+       ordered from MOST relevant to LEAST relevant. Projects are ordered from most to least relevant.
+    4. Rank skill_ids from MOST to LEAST relevant for the target role.
+    5. target_role must be a concise title adapted to the job description (e.g. 'Senior Backend Engineer').
+    {summary_rule}
     """
 
     data = _call_llm_json(
@@ -578,39 +651,88 @@ def select_cv_content(
         schema=schema,
         api_key=api_key,
         model=model,
+        max_tokens=2600,
     )
     raw_selection = CVSelection(**data)
 
     valid_skill_ids = {s.id for s in master_cv.skills}
+    valid_exp_order = [exp.id for exp in master_cv.experience]
     valid_exp_ids = {
-        exp.id: {b.id for b in exp.bullets} for exp in master_cv.experience
+        exp.id: [b.id for b in exp.bullets] for exp in master_cv.experience
     }
+    valid_proj_order = [proj.id for proj in master_cv.projects]
     valid_proj_ids = {
-        proj.id: {b.id for b in proj.bullets} for proj in master_cv.projects
+        proj.id: [b.id for b in proj.bullets] for proj in master_cv.projects
     }
     valid_edu_ids = {edu.id for edu in master_cv.education}
 
-    cleaned_skills = [sid for sid in raw_selection.skill_ids if sid in valid_skill_ids]
+    # --- Skills: keep ranked order, drop hallucinations, append any omitted. ---
+    cleaned_skills: list[str] = []
+    seen_skills: set[str] = set()
+    for sid in raw_selection.skill_ids:
+        if sid in valid_skill_ids and sid not in seen_skills:
+            cleaned_skills.append(sid)
+            seen_skills.add(sid)
+    for s in master_cv.skills:
+        if s.id not in seen_skills:
+            cleaned_skills.append(s.id)
+            seen_skills.add(s.id)
 
-    cleaned_experiences = []
-    for exp in raw_selection.experiences:
-        if exp.experience_id in valid_exp_ids:
-            allowed_bullets = valid_exp_ids[exp.experience_id]
-            valid_bullets = [bid for bid in exp.bullet_ids if bid in allowed_bullets]
-            cleaned_experiences.append(
-                SelectedExperience(
-                    experience_id=exp.experience_id, bullet_ids=valid_bullets
-                )
-            )
+    def _scrub_experience_like(raw_blocks, valid_order, valid_bullets_map):
+        """Keeps LLM ranking, drops hallucinated IDs, appends omitted valid items.
 
-    cleaned_projects = []
-    for proj in raw_selection.projects:
-        if proj.project_id in valid_proj_ids:
-            allowed_bullets = valid_proj_ids[proj.project_id]
-            valid_bullets = [bid for bid in proj.bullet_ids if bid in allowed_bullets]
-            cleaned_projects.append(
-                SelectedProject(project_id=proj.project_id, bullet_ids=valid_bullets)
+        For every experience/project that exists in the master CV we ALWAYS return
+        a block (never dropping it), with all bullets ranked-first then any omitted
+        valid bullets appended. Nothing is lost before the layout engine runs.
+        """
+        ordered_blocks = []
+        seen_block_ids: set[str] = set()
+
+        # First pass: honour the LLM's block order, validating IDs.
+        for raw in raw_blocks:
+            block_id = (
+                raw.experience_id if hasattr(raw, "experience_id") else raw.project_id
             )
+            if block_id in valid_bullets_map and block_id not in seen_block_ids:
+                raw_bullet_ids = raw.bullet_ids
+                allowed = valid_bullets_map[block_id]
+                kept: list[str] = []
+                seen_b: set[str] = set()
+                for bid in raw_bullet_ids:
+                    if bid in allowed and bid not in seen_b:
+                        kept.append(bid)
+                        seen_b.add(bid)
+                # Append any valid bullets the LLM omitted, preserving CV order.
+                for bid in allowed:
+                    if bid not in seen_b:
+                        kept.append(bid)
+                        seen_b.add(bid)
+                ordered_blocks.append((block_id, kept))
+                seen_block_ids.add(block_id)
+
+        # Second pass: append any valid blocks the LLM omitted entirely.
+        for block_id in valid_order:
+            if block_id not in seen_block_ids:
+                ordered_blocks.append((block_id, list(valid_bullets_map[block_id])))
+                seen_block_ids.add(block_id)
+
+        return ordered_blocks
+
+    ordered_experiences = _scrub_experience_like(
+        raw_selection.experiences, valid_exp_order, valid_exp_ids
+    )
+    ordered_projects = _scrub_experience_like(
+        raw_selection.projects, valid_proj_order, valid_proj_ids
+    )
+
+    cleaned_experiences = [
+        SelectedExperience(experience_id=eid, bullet_ids=bids)
+        for eid, bids in ordered_experiences
+    ]
+    cleaned_projects = [
+        SelectedProject(project_id=pid, bullet_ids=bids)
+        for pid, bids in ordered_projects
+    ]
 
     cleaned_education = [
         eid for eid in raw_selection.education_ids if eid in valid_edu_ids
@@ -625,18 +747,15 @@ def select_cv_content(
         )
         cleaned_education = [edu.id for edu in master_cv.education]
 
-    # Safety net: never ship a CV with zero experience. If the LLM selection was
-    # emptied by validation, fall back to every experience (with all its bullets).
-    if not cleaned_experiences and master_cv.experience:
-        print(
-            "[!] No experiences survived validation; falling back to all experiences."
-        )
-        cleaned_experiences = [
-            SelectedExperience(
-                experience_id=exp.id, bullet_ids=[b.id for b in exp.bullets]
-            )
-            for exp in master_cv.experience
-        ]
+    # Summary selection: deterministic. Only pick an id that exists in
+    # master_cv.summaries; otherwise fall back to the first one. Never generate.
+    cleaned_summary_id: str | None = None
+    if master_cv.summaries:
+        valid_summary_ids = {s.id for s in master_cv.summaries}
+        if raw_selection.summary_id in valid_summary_ids:
+            cleaned_summary_id = raw_selection.summary_id
+        else:
+            cleaned_summary_id = master_cv.summaries[0].id
 
     return CVSelection(
         language=language,
@@ -645,6 +764,7 @@ def select_cv_content(
         experiences=cleaned_experiences,
         projects=cleaned_projects,
         education_ids=cleaned_education,
+        summary_id=cleaned_summary_id,
     )
 
 
@@ -738,6 +858,136 @@ def verify_cover_letter(letter: CoverLetterDraft, master_cv: MasterCV) -> list[s
     return errors
 
 
+def _build_cover_letter_catalog(
+    master_cv: MasterCV,
+    language: Literal["en", "fr"],
+    selection: "CVSelection | None" = None,
+    fit_result: "FitAnalysis | None" = None,
+) -> dict:
+    """Builds a compact, single-language, focused context payload for the LLM.
+
+    Groq's free tier caps a single request at 8,000 TPM (prompt + max_tokens), so we:
+
+    * resolve every localized field to the ACTIVE ``language`` only (never serialize
+      the inactive one), and
+    * when a ``selection`` is provided, pass a focused top-ranked slice rather than
+      the entire CV (which now preserves all ranked skills/bullets):
+
+        - top 12 ranked skills,
+        - top 2 experiences with all their ranked bullets, plus the 3rd experience
+          capped at its top 2 bullets,
+        - top 2 projects with up to 2 ranked bullets each,
+        - the selected summary (if any),
+        - facts, plus ``fit_result`` strengths / covered_keywords when supplied.
+
+    The full selection is still used for CV compilation elsewhere; only this
+    cover-letter context is trimmed.
+    """
+    lang = language
+    skills_by_id = {s.id: s for s in master_cv.skills}
+    exp_by_id = {e.id: e for e in master_cv.experience}
+    proj_by_id = {p.id: p for p in master_cv.projects}
+
+    catalog: dict = {"candidate_name": master_cv.personal_info.name}
+
+    # Facts (already language-neutral scalars).
+    catalog["facts"] = master_cv.facts.model_dump()
+
+    # --- Skills: top 12 ranked, resolved to the active language only. ---
+    if selection is not None:
+        ranked_skill_ids = selection.skill_ids
+    else:
+        ranked_skill_ids = [s.id for s in master_cv.skills]
+    top_skill_ids = ranked_skill_ids[:12]
+    skills_out = []
+    for sid in top_skill_ids:
+        skill = skills_by_id.get(sid)
+        if skill is None:
+            continue
+        skills_out.append({"id": skill.id, "name": getattr(skill, lang)})
+    catalog["skills"] = skills_out
+
+    # --- Experience: top 2 fully, 3rd capped at 2 bullets. ---
+    if selection is not None:
+        sel_exps = selection.experiences
+    else:
+        sel_exps = [
+            SelectedExperience(experience_id=e.id, bullet_ids=[b.id for b in e.bullets])
+            for e in master_cv.experience
+        ]
+    exp_out = []
+    for rank_idx, sel_exp in enumerate(sel_exps):
+        exp = exp_by_id.get(sel_exp.experience_id)
+        if exp is None:
+            continue
+        bullet_lookup = {b.id: b for b in exp.bullets}
+        if rank_idx < 2:
+            bullet_ids = sel_exp.bullet_ids
+        elif rank_idx == 2:
+            bullet_ids = sel_exp.bullet_ids[:2]
+        else:
+            continue
+        bullets_out = [
+            {"id": bid, "text": getattr(bullet_lookup[bid], lang)}
+            for bid in bullet_ids
+            if bid in bullet_lookup
+        ]
+        exp_out.append(
+            {
+                "id": exp.id,
+                "role": getattr(exp.role, lang),
+                "company": exp.company,
+                "bullets": bullets_out,
+            }
+        )
+    catalog["experience"] = exp_out
+
+    # --- Projects: top 2, up to 2 ranked bullets each. ---
+    if selection is not None:
+        sel_projs = selection.projects
+    else:
+        sel_projs = [
+            SelectedProject(project_id=p.id, bullet_ids=[b.id for b in p.bullets])
+            for p in master_cv.projects
+        ]
+    proj_out = []
+    for sel_proj in sel_projs[:2]:
+        proj = proj_by_id.get(sel_proj.project_id)
+        if proj is None:
+            continue
+        bullet_lookup = {b.id: b for b in proj.bullets}
+        bullets_out = [
+            {"id": bid, "text": getattr(bullet_lookup[bid], lang)}
+            for bid in sel_proj.bullet_ids[:2]
+            if bid in bullet_lookup
+        ]
+        proj_out.append({"id": proj.id, "name": proj.name, "bullets": bullets_out})
+    catalog["projects"] = proj_out
+
+    # --- Summary: the selected grounded variant for the active language. ---
+    if master_cv.summaries:
+        chosen = None
+        if selection is not None and selection.summary_id:
+            for s in master_cv.summaries:
+                if s.id == selection.summary_id:
+                    chosen = s
+                    break
+        if chosen is None:
+            chosen = master_cv.summaries[0]
+        summary_text = getattr(chosen, lang) or ""
+        if summary_text.strip():
+            catalog["summary"] = summary_text.strip()
+
+    # --- Fit-analysis signals (job-tailoring hints, already language-neutral). ---
+    if fit_result is not None:
+        if fit_result.strengths:
+            catalog["fit_strengths"] = list(fit_result.strengths)
+        if fit_result.covered_keywords:
+            catalog["fit_covered_keywords"] = list(fit_result.covered_keywords)
+
+    return catalog
+
+
 def generate_cover_letter(
     job_text: str,
     master_cv: MasterCV,
@@ -745,41 +995,24 @@ def generate_cover_letter(
     language: Literal["en", "fr"] = "en",
     model: str = "openai/gpt-oss-120b",
     max_retries: int = 2,
+    selection: "CVSelection | None" = None,
+    fit_result: "FitAnalysis | None" = None,
 ) -> CoverLetter:
     """
     FR-9 & FR-10: Generates a tailored 3-4 paragraph cover letter where every factual claim
     cites a Master CV ID. Automatically triggers re-prompting if verification checks fail.
+
+    To stay within Groq's 8,000 TPM single-request limit, the context payload is
+    built by :func:`_build_cover_letter_catalog`: single-language only, a focused
+    top-ranked slice of the CV (when ``selection`` is provided), and compact JSON.
     """
     schema = CoverLetterDraft.model_json_schema()
 
-    catalog = {
-        "candidate_name": master_cv.personal_info.name,
-        "facts": master_cv.facts.model_dump(),
-        "skills": [
-            {"id": s.id, "name": getattr(s, language)} for s in master_cv.skills
-        ],
-        "experience": [
-            {
-                "id": exp.id,
-                "role": getattr(exp.role, language),
-                "company": exp.company,
-                "bullets": [
-                    {"id": b.id, "text": getattr(b, language)} for b in exp.bullets
-                ],
-            }
-            for exp in master_cv.experience
-        ],
-        "projects": [
-            {
-                "id": proj.id,
-                "name": proj.name,
-                "bullets": [
-                    {"id": b.id, "text": getattr(b, language)} for b in proj.bullets
-                ],
-            }
-            for proj in master_cv.projects
-        ],
-    }
+    catalog = _build_cover_letter_catalog(
+        master_cv, language, selection=selection, fit_result=fit_result
+    )
+    # Compact JSON (no indentation/whitespace tokens) keeps the prompt small.
+    catalog_json = json.dumps(catalog, separators=(",", ":"))
 
     base_prompt = f"""
 You are an expert technical cover letter writer.
@@ -788,7 +1021,7 @@ Draft a professional, compelling, 3-to-4 paragraph cover letter tailored to the 
 TARGET LANGUAGE: {language}
 
 CANDIDATE DATA & VALID IDs:
-{json.dumps(catalog, indent=2)}
+{catalog_json}
 
 JOB DESCRIPTION:
 \"\"\"{job_text}\"\"\"
@@ -818,6 +1051,7 @@ CRITICAL HONESTY & FORMAT RULES:
             schema=schema,
             api_key=api_key,
             model=model,
+            max_tokens=2600,
         )
         # Keep a serialized copy so we can echo it back as the assistant turn on retries.
         raw_content = json.dumps(data)
@@ -1151,10 +1385,17 @@ STRICT EXTRACTION RULES (zero fabrication — this is the core guarantee of the 
    DECOMPOSE grouped skills into ATOMIC entries: 'Python (Pandas, NumPy, Scikit-learn)'
    becomes FOUR skills: Python (sk_python), Pandas (sk_pandas), NumPy (sk_numpy),
    Scikit-learn (sk_scikit_learn). Never keep parenthetical groups as a single skill.
+   Assign each atomic skill a bilingual 'category' (both en and fr), choosing from:
+     - 'Languages & Databases' / 'Langages & Bases de données'
+     - 'Python & ML' / 'Python & ML'
+     - 'BI & Analytics' / 'BI & Analytique'
+     - 'Tools' / 'Outils'
+     - 'Spoken Languages' / 'Langues'
 6. SPOKEN LANGUAGES: Extract spoken languages and proficiency levels stated ANYWHERE in
    the CV (Skills, Summary, header) as atomic 'skills' entries preserving the level tag,
    e.g. 'Arabic (native)'/'Arabe (natif)', 'English (C1)'/'Anglais (C1)',
    'French (B2)'/'Français (B2)'. Do NOT drop languages just because they are in a Summary.
+   These should carry category 'Spoken Languages' / 'Langues'.
 7. EXPERIENCE: EVERY work entry. Translate each bullet faithfully to French ('fr'); the French
    MUST preserve all numbers/metrics exactly.
 8. PROJECTS: Extract EVERY project present in the document (do not stop early). One entry per
@@ -1163,6 +1404,11 @@ STRICT EXTRACTION RULES (zero fabrication — this is the core guarantee of the 
    ONE entry per degree, id 'edu_<slug>', with institution, full degree title, graduation year.
    Right-aligned dates belong to that degree's line — do not drop the education section.
 10. If 'experience' or 'education' is mentioned anywhere, it MUST NOT be empty.
+11. SUMMARIES: If the CV opens with a professional summary/profile/objective paragraph,
+    extract it into 'summaries' as id 'sum_default' with faithful 'en' and 'fr' translations.
+    Strip any trailing 'Languages: ...' / 'Langues : ...' sentence from the summary text
+    (those languages are captured separately as skills). If there is no summary paragraph,
+    return an empty 'summaries' list [].
 """
 
     data = _call_llm_json(
@@ -1177,6 +1423,7 @@ STRICT EXTRACTION RULES (zero fabrication — this is the core guarantee of the 
         api_key=api_key,
         model=model,
         temperature=0.0,
+        max_tokens=6000,
     )
     cv = MasterCV(**data)
     warnings = ground_extraction(cv, pdf_text)
@@ -1190,7 +1437,9 @@ def _normalize_extracted_skills(cv: MasterCV) -> MasterCV:
     'Python (Pandas, NumPy, Scikit-learn)' (or a slash/comma list). Atomic skills
     get clean ids ('sk_python', 'sk_pandas', ...) and deduplicated EN/FR labels.
     Proficiency parentheticals (e.g. 'English (C1)', 'Arabic (native)') are
-    preserved verbatim. Returns a new MasterCV; the input is not mutated.
+    preserved verbatim. Each atomic skill inherits its source skill's ``category``
+    (grouped skills share the parent category). Returns a new MasterCV; the input
+    is not mutated.
     """
     seen_en: set[str] = set()
     seen_ids: set[str] = set()
@@ -1221,9 +1470,67 @@ def _normalize_extracted_skills(cv: MasterCV) -> MasterCV:
                 new_id = f"{new_id}_{suffix}"
             seen_ids.add(new_id)
 
-            new_skills.append(Skill(id=new_id, en=en_name.strip(), fr=fr_name.strip()))
+            new_skills.append(
+                Skill(
+                    id=new_id,
+                    en=en_name.strip(),
+                    fr=fr_name.strip(),
+                    category=skill.category,
+                )
+            )
 
     return cv.model_copy(update={"skills": new_skills})
+
+
+# Trailing "Languages: ..." / "Langues : ..." segment to strip from a summary when
+# those spoken languages are already captured as skills.
+_SUMMARY_LANGUAGES_RE = re.compile(
+    r"(?:^|[\s.])(?:languages?|langues?)\s*[:\-–]\s*[^.]*\.?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _strip_languages_from_summary(text: str) -> str:
+    """Removes a trailing 'Languages: ...' clause from a summary paragraph."""
+    if not text:
+        return text
+    stripped = _SUMMARY_LANGUAGES_RE.sub("", text).strip()
+    return stripped or text.strip()
+
+
+def _normalize_summaries(cv: MasterCV) -> MasterCV:
+    """Cleans extracted summary variants deterministically.
+
+    - Assigns the canonical id ``sum_default`` to a single summary (or stable ids
+      to multiple), so the selector/renderer can address them.
+    - Strips a trailing 'Languages: ...' sentence from EN and FR text since those
+      languages are captured separately as skills.
+    - Drops entirely empty summaries. Returns a new MasterCV; input not mutated.
+    """
+    if not cv.summaries:
+        return cv
+
+    cleaned = []
+    seen_ids: set[str] = set()
+    for idx, summary in enumerate(cv.summaries):
+        en = _strip_languages_from_summary(summary.en or "")
+        fr = _strip_languages_from_summary(summary.fr or "")
+        if not en.strip() and not fr.strip():
+            continue
+        sid = (summary.id or "").strip() or f"sum_{idx}"
+        if sid in seen_ids:
+            suffix = 2
+            while f"{sid}_{suffix}" in seen_ids:
+                suffix += 1
+            sid = f"{sid}_{suffix}"
+        seen_ids.add(sid)
+        cleaned.append(SummaryVariant(id=sid, en=en, fr=fr))
+
+    # Canonical id for the (single) primary summary, preserving extraction order.
+    if cleaned and cleaned[0].id != "sum_default":
+        cleaned[0] = cleaned[0].model_copy(update={"id": "sum_default"})
+
+    return cv.model_copy(update={"summaries": cleaned})
 
 
 def build_master_cv_from_pdf(
@@ -1232,7 +1539,8 @@ def build_master_cv_from_pdf(
     """Shared PDF -> MasterCV pipeline used by both the CLI and the Streamlit UI.
 
     Extracts reading-ordered text plus anchored hyperlinks, runs LLM extraction,
-    deterministically splits any grouped skills into atomic entries, and returns
+    deterministically splits any grouped skills into atomic entries (preserving
+    each skill's bilingual category), normalizes summary variants, and returns
     ``(master_cv, warnings)`` where warnings are grounding issues.
     """
     text, links = extract_pdf_content(pdf_source)
@@ -1240,6 +1548,7 @@ def build_master_cv_from_pdf(
         text, api_key=api_key, model=model, hyperlinks=links
     )
     cv = _normalize_extracted_skills(cv)
+    cv = _normalize_summaries(cv)
     return cv, warnings
 
 
