@@ -21,6 +21,52 @@ LATEX_ESCAPE_MAP = {
     "^": r"\textasciicircum{}",
 }
 
+# French month names for localizing the cover-letter date.
+_FRENCH_MONTHS = [
+    "janvier",
+    "février",
+    "mars",
+    "avril",
+    "mai",
+    "juin",
+    "juillet",
+    "août",
+    "septembre",
+    "octobre",
+    "novembre",
+    "décembre",
+]
+
+# Greeting prefixes that may leak into the first body sentence. The template
+# already prints the salutation, so these are stripped defensively.
+_GREETING_PREFIX_RE = re.compile(
+    r"^\s*(madame\s*,\s*monsieur|monsieur\s*,\s*madame|mesdames\s*,\s*messieurs|"
+    r"madame|monsieur|dear\s+[^,\n:]+|to\s+whom\s+it\s+may\s+concern)\s*[,:]?\s*",
+    re.IGNORECASE,
+)
+
+# Sign-off phrases that may leak into the body or replace the template sign-off.
+_SIGNOFF_PREFIX_RE = re.compile(
+    r"^\s*(cordialement|bien\s+cordialement|respectueusement|sinc[eè]rement|"
+    r"sincerely|best\s+regards|kind\s+regards|regards|yours\s+(?:sincerely|faithfully))\s*[,:]?\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_leading_greeting(text: str) -> str:
+    """Removes a leading salutation from body text."""
+    if not text:
+        return text
+    return _GREETING_PREFIX_RE.sub("", text, count=1).strip()
+
+
+def _localized_date(lang: str, today: Optional[datetime.date] = None) -> str:
+    """Formats today's date in the target language (French month names for 'fr')."""
+    today = today or datetime.date.today()
+    if lang == "fr":
+        return f"{today.day} {_FRENCH_MONTHS[today.month - 1]} {today.year}"
+    return today.strftime("%B %d, %Y")
+
 
 def escape_latex(text: str) -> str:
     """Escapes special LaTeX characters in plain text strings."""
@@ -323,7 +369,12 @@ def compile_to_single_page(
 def render_letter_latex(letter: CoverLetter, master_cv: MasterCV) -> str:
     """Renders a formal ATS-compliant LaTeX cover letter from flat sentence records."""
     p_info = master_cv.personal_info
-    current_date = datetime.date.today().strftime("%B %d, %Y")
+    lang = letter.language
+    current_date = _localized_date(lang)
+
+    # Localized recipient default and sign-off.
+    recipient = "Équipe de recrutement" if lang == "fr" else "Hiring Team"
+    default_signoff = "Cordialement" if lang == "fr" else "Sincerely"
 
     # Build the sender contact line dynamically (phone/location only when present).
     sender_parts = []
@@ -371,7 +422,7 @@ def render_letter_latex(letter: CoverLetter, master_cv: MasterCV) -> str:
 
 \begin{{flushleft}}
     \textbf{{{escape_latex(current_date)}}} \\[8pt]
-    \textbf{{Hiring Team}} \\
+    \textbf{{{escape_latex(recipient)}}} \\
     \textbf{{{escape_latex(letter.company)}}}
 \end{{flushleft}}
 
@@ -389,13 +440,25 @@ def render_letter_latex(letter: CoverLetter, master_cv: MasterCV) -> str:
     body_paragraphs = []
     for p_num in sorted(para_dict.keys()):
         paragraph_text = " ".join(para_dict[p_num])
-        body_paragraphs.append(escape_latex(paragraph_text))
+        # Defensive: strip any greeting the model left at the start of the body,
+        # since the salutation is rendered separately above.
+        paragraph_text = _strip_leading_greeting(paragraph_text)
+        if paragraph_text:
+            body_paragraphs.append(escape_latex(paragraph_text))
 
     body_latex = "\n\n".join(body_paragraphs)
 
-    clean_signoff = letter.signoff.split(",")[0].strip()
-    if letter.signoff.lower().replace(",", "").strip().endswith(p_info.name.lower()):
-        clean_signoff = "Sincerely"
+    # Determine the sign-off. Honour a model-provided sign-off only if it's a
+    # genuine phrase (not the candidate's name), otherwise use the localized
+    # default. Strip any leading sign-off phrase the model embedded in the body.
+    clean_signoff = _SIGNOFF_PREFIX_RE.sub("", letter.signoff.strip(), count=1).strip()
+    clean_signoff = clean_signoff.split(",")[0].strip()
+    if (
+        not clean_signoff
+        or clean_signoff.lower().endswith(p_info.name.lower())
+        or p_info.name.lower() in clean_signoff.lower()
+    ):
+        clean_signoff = default_signoff
 
     footer = rf"""
 

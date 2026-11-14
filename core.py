@@ -648,6 +648,66 @@ def select_cv_content(
     )
 
 
+# Leading greeting phrases the LLM may (incorrectly) emit as the first sentence
+# even though the LaTeX template already prints the salutation.
+_GREETING_PREFIX_RE = re.compile(
+    r"^\s*(madame\s*,\s*monsieur|monsieur\s*,\s*madame|madame\s*,\s*monsieur\s*,|"
+    r"mesdames\s*,\s*messieurs|madame|monsieur|mme|m\.|dr\.?|"
+    r"dear\s+[^,\n:]+|to\s+whom\s+it\s+may\s+concern)\s*[,:]?\s*",
+    re.IGNORECASE,
+)
+
+# Trailing sign-off phrases the LLM may emit as the final sentence even though
+# the LaTeX template already prints the sign-off and the candidate's name.
+_SIGNOFF_PREFIX_RE = re.compile(
+    r"^\s*(cordialement|bien\s+cordialement|respectueusement|sinc[eè]rement|"
+    r"sincerely|best\s+regards|kind\s+regards|regards|yours\s+(?:sincerely|faithfully)|"
+    r"veuillez\s+agr[ée]er[^.\n]*)\s*[,:]?\s*",
+    re.IGNORECASE,
+)
+
+
+def _strip_leading_greeting(text: str) -> str:
+    """Removes a leading salutation line from cover-letter body text."""
+    if not text:
+        return text
+    return _GREETING_PREFIX_RE.sub("", text, count=1).strip()
+
+
+def _strip_trailing_signoff(text: str) -> str:
+    """Removes a leading/embedded sign-off phrase from the first body sentence."""
+    if not text:
+        return text
+    return _SIGNOFF_PREFIX_RE.sub("", text, count=1).strip()
+
+
+def _normalize_cover_letter_body(letter: CoverLetterDraft) -> CoverLetterDraft:
+    """Strips greeting prefixes and sign-off text from the LLM's sentence array.
+
+    The LaTeX template renders the salutation and sign-off itself, so any
+    greeting/sign-off the model placed inside 'sentences' would otherwise appear
+    twice. This is deterministic and returns a new CoverLetterDraft.
+    """
+    cleaned_sentences = []
+    for sentence in letter.sentences:
+        text = sentence.text or ""
+        text = _strip_leading_greeting(text)
+        # Sign-off may be its own trailing sentence or prefixed to it.
+        text = _strip_trailing_signoff(text)
+        # Drop a sentence that became the candidate's bare name after stripping.
+        if not text.strip():
+            continue
+        cleaned_sentences.append(
+            CoverLetterSentence(
+                paragraph=sentence.paragraph,
+                text=text.strip(),
+                based_on=sentence.based_on,
+            )
+        )
+
+    return letter.model_copy(update={"sentences": cleaned_sentences})
+
+
 def verify_cover_letter(letter: CoverLetterDraft, master_cv: MasterCV) -> list[str]:
     """Runs deterministic verification on citations, numerals, and skill claims."""
     errors = []
@@ -740,6 +800,7 @@ CRITICAL HONESTY & FORMAT RULES:
 4. DO NOT invent metrics or numbers. Only use numbers present in the candidate facts or bullets.
 5. DO NOT reference technologies or skills not listed in the candidate data.
 6. NEVER name a programming language, framework, or library that is absent from the candidate's skills, experience, and projects — even if the job description mentions it. This includes single-letter languages like 'R'. Derive the language from the candidate data only.
+7. The 'sentences' array must contain BODY PARAGRAPHS ONLY. Do NOT include a greeting/salutation (e.g. 'Madame, Monsieur,' / 'Dear Hiring Team,') and do NOT include a closing sign-off (e.g. 'Cordialement,' / 'Sincerely,'). The greeting and sign-off are rendered separately by the document template.
 """
 
     messages = [
@@ -762,6 +823,10 @@ CRITICAL HONESTY & FORMAT RULES:
         raw_content = json.dumps(data)
 
         draft = CoverLetterDraft(**data)
+
+        # Strip any greeting/sign-off the model echoed into the body so the
+        # template's own salutation and sign-off are not duplicated.
+        draft = _normalize_cover_letter_body(draft)
 
         errors = verify_cover_letter(draft, master_cv)
 
@@ -827,6 +892,25 @@ PRESERVE_HYPHEN_TERMS = {
 }
 
 _SOFT_HYPHEN_RE = re.compile(r"(\w+)-[ \t]*\n[ \t]*(\w+)")
+
+# Literal currency/backslash artifacts left by PDF extraction. A source token
+# like "\$0" carries a stray backslash; without normalization the "$" still gets
+# escaped to "\$" while the original "\" remains, producing a broken "0\$"
+# (or "\textbackslash{}$") artifact in the compiled output. Collapsing "\$" -> "$"
+# first lets LaTeX cleanly render a single "$".
+_BACKSLASH_DOLLAR_RE = re.compile(r"\\\$")
+
+
+def _normalize_pdf_artifacts(text: str) -> str:
+    """Normalizes literal ``\\$`` sequences (common in currency amounts) to ``$``.
+
+    Prevents the doubled-escape artifact (``\\textbackslash{}$`` / ``0\\$``) in
+    rendered output by removing the stray backslash while preserving the dollar
+    symbol so LaTeX escaping can cleanly emit ``$``.
+    """
+    if not text:
+        return text
+    return _BACKSLASH_DOLLAR_RE.sub("$", text)
 
 
 def _dehyphenate(text: str) -> str:
@@ -910,7 +994,7 @@ def extract_text_from_pdf(pdf_source: bytes | str) -> str:
         doc.close()
 
     extracted_text = "\n".join(pages_text).strip()
-    return _dehyphenate(extracted_text)
+    return _normalize_pdf_artifacts(_dehyphenate(extracted_text))
 
 
 def _anchor_text_for_rect(page: "pymupdf.Page", rect: "pymupdf.Rect") -> str:
@@ -931,7 +1015,7 @@ def extract_pdf_content(pdf_source: bytes | str) -> tuple[str, list[PdfLink]]:
     """Extracts reading-ordered text and anchored hyperlinks from a PDF.
 
     Returns ``(text, links)`` where each link carries the visible anchor text found
-    near its rectangle (e.g. the 'Live demo' label under a project), so downstream
+        near its rectangle (e.g. the 'Live demo' label under a project), so downstream
     extraction can map URLs to the correct schema field.
     """
     if isinstance(pdf_source, (bytes, bytearray)):
@@ -957,7 +1041,7 @@ def extract_pdf_content(pdf_source: bytes | str) -> tuple[str, list[PdfLink]]:
     finally:
         doc.close()
 
-    text = _dehyphenate("\n".join(pages_text).strip())
+    text = _normalize_pdf_artifacts(_dehyphenate("\n".join(pages_text).strip()))
     return text, links
 
 
